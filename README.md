@@ -1,14 +1,64 @@
-# scan_backdoors 2.1.1: parameter reference
+# scan_backdoors 2.1: parameter reference
 
-A scanner for backdoors, web shells and malicious code on Joomla/PHP sites.
-Only Python 3.6+ is required, nothing needs to be installed.
+A scanner for backdoors, web shells and malicious code on Joomla/PHP sites, with a mass-cleanup tool and a browser-based GUI.
+Only Python 3.6+ is required, nothing needs to be installed (no Tk, no pip).
 
-Three ways to launch it: double-click `start.bat` (Windows, opens the GUI), start the GUI with `scan_backdoors_gui.py`, or run the scanner from the command line.
+## Launching
+
+The package consists of four files that must stay in the same folder:
+
+| File | Purpose |
+|---|---|
+| `scan_backdoors_gui.py` | Browser-based GUI: a small local web server plus a page in your browser (scan, results table, quarantine/delete, mass cleanup) |
+| `scan_backdoors.py` | The scanner (command line) |
+| `clean_malware.py` | Mass cleanup (command line; also used by the GUI "Mass cleanup" button) |
+| `start.bat` | Windows launcher for the GUI |
+
+### Windows: `start.bat`
+
+Double-click `start.bat`. It switches to its own folder, finds Python (`py -3`, otherwise `python`), starts `scan_backdoors_gui.py` and your default browser opens the page.
+If Python is not found, or the server exits with an error, the window stays open with a hint.
+
+Requirements: Python 3.6+ (tick "Add python.exe to PATH" in the installer from python.org).
+Keep the console window open while you work: closing it stops the server. You can also stop it with the **Quit server** button in the page.
+
+### Any OS: `scan_backdoors_gui.py`
 
 ```
-start.bat                                    # Windows: double-click, opens the GUI
-python3 scan_backdoors_gui.py                # the GUI from the console
-python3 scan_backdoors.py [folder] [options] # command line, options below
+python3 scan_backdoors_gui.py                 # start and open the browser
+python3 scan_backdoors_gui.py --no-browser    # start without opening the browser
+python3 scan_backdoors_gui.py --port 9000     # use another port
+```
+
+### Open it from a browser bookmark
+
+The server always uses the same address, **http://127.0.0.1:8765/** (the port is fixed on purpose). Bookmark it and the page opens from the bookmark whenever the server is running.
+Starting the script a second time while it is already running does not start another copy, it only opens the page again.
+If port 8765 is taken by another program, the next free port is used and the console prints the new address (the bookmark then has to be updated).
+
+To have the server running all the time without a console window, on Windows put a shortcut to `pythonw scan_backdoors_gui.py --no-browser` into the Startup folder (`Win+R`, `shell:startup`).
+The page remembers the last state (log, results) while the server runs, so you can close and reopen the tab at any moment.
+
+### Security
+
+- The server listens on **127.0.0.1 only**, it is not reachable from other computers.
+- Requests are accepted only for the host names `127.0.0.1`/`localhost` on its own port (protects against DNS rebinding) and only with a custom header and a JSON body (protects against requests from other web sites).
+- File names and code snippets from the scanned site are shown as plain text, never as HTML.
+- To use the GUI on a remote server, do not open the port, use an SSH tunnel instead: `ssh -L 8765:127.0.0.1:8765 user@server`, then open http://127.0.0.1:8765/ locally.
+
+### First run in the GUI
+
+1. **Settings** tab: choose the *Site folder* (optionally a *Clean Joomla* folder, a *Whitelist* and the report paths). **Browse…** opens a file chooser that lists the folders of the machine where the server runs.
+2. **Run and results** tab: press *Start scan*. The progress bar and the log show the scan, the table lists the findings.
+3. Select rows (click, Ctrl/Shift+click, Ctrl+A) and use *Show file*, *Quarantine*, *Delete from disk* (or the Delete key), or the right-click menu (copy path, copy SHA-256, add to whitelist). *Mass cleanup* handles the known malware families across the whole site: it first shows a plan and asks for confirmation.
+4. Open the reports (CSV/XLSX/JSON) with the buttons above the table, or download them through the links next to them.
+
+Settings are saved automatically in `~/.scan_backdoors_gui.json` (the same file the older desktop version used). The command-line options are described below.
+
+## Command line
+
+```
+python3 scan_backdoors.py [folder] [options]
 ```
 
 If no folder is given, the current one is scanned. **All** folders are checked by default, including `cache`, `tmp`, `logs`, `media`.
