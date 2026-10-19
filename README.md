@@ -1,3 +1,5 @@
+<p align="center"><img src="emblem_ScanBackDoors_512.png" alt="Scan Backdoors" width="200"></p>
+
 # scan_backdoors 2.1: parameter reference
 
 A scanner for backdoors, web shells and malicious code on Joomla/PHP sites, with a mass-cleanup tool and a browser-based GUI.
@@ -13,6 +15,8 @@ The package consists of four files that must stay in the same folder:
 | `scan_backdoors.py` | The scanner (command line) |
 | `clean_malware.py` | Mass cleanup (command line; also used by the GUI "Mass cleanup" button) |
 | `start.bat` | Windows launcher for the GUI |
+
+Optional files: `emblem_ScanBackDoors_512.png` (the logo; the GUI has a small copy of it built in, so it works without this file) and `scan_backdoors.ico` (an icon for a desktop shortcut to `start.bat`: right-click the shortcut, *Properties*, *Change Icon…*, choose this file).
 
 ### Windows: `start.bat`
 
