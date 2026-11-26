@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The bundle has one
 version for all three components; it is written once in `src/version.py` and a
 release is a tag with that number.
 
-## Unreleased
+## v3.2 — 2026-11-27
 
 - Scanner: webshell detection no longer requires the request array to be written
   into the sink directly. New signatures follow the value: a superglobal read
