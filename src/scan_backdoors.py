@@ -83,6 +83,7 @@ SEV_CRIT = "[CRITICAL]"
 SEV_OBF = "[OBFUSCATED]"
 SEV_WARN = "[WARNING]"
 SEV_RANK = {SEV_CRIT: 0, SEV_OBF: 1, SEV_WARN: 2}
+SEV_SARIF = {SEV_CRIT: "error", SEV_OBF: "warning", SEV_WARN: "note"}
 DEFAULT_WEIGHT = {SEV_CRIT: 10, SEV_OBF: 3, SEV_WARN: 1}
 SCORE_CAP = {SEV_CRIT: 200, SEV_OBF: 45, SEV_WARN: 9}   # WARNING alone never gives MEDIUM (threshold is 10)
 HIGH_SCORE = 25      # >= HIGH
@@ -1105,6 +1106,52 @@ def write_json(path, results, stats):
         json.dump(data, f, ensure_ascii=False, indent=1)
 
 
+def uri_of(p):
+    p = (p or "").replace(os.sep, "/")
+    if not p:
+        return ""
+    return ("file:///" if re.match(r"^[A-Za-z]:/", p) else "file://") + p
+
+
+def write_sarif(path, results, stats):
+    """SARIF 2.1.0 report so the findings can be imported into code-scanning
+    tools (GitHub code scanning, Azure DevOps, CodeQL CLI upload).
+
+    One result per finding: the rule is the signature label, the level follows
+    the severity (CRITICAL -> error, OBFUSCATED -> warning, WARNING -> note),
+    the location is the file with the line of the finding when the check has one.
+    """
+    rules, artifacts, sarif_results = {}, [], []
+    for r in results:
+        artifacts.append({"uri": r["path"], "uriBaseId": "%SRCROOT%", "length": r["size"]})
+        for sev, line, label, snip, _w in r["hits"]:
+            if label not in rules:
+                rules[label] = {"id": label, "name": label,
+                                "shortDescription": {"text": label},
+                                "defaultConfiguration": {"level": SEV_SARIF[sev]}}
+            location = {"artifactLocation": {"uri": r["path"], "uriBaseId": "%SRCROOT%"}}
+            if line:
+                location["region"] = {"startLine": line, "endLine": line}
+            message = label + ((" - %s" % snip) if snip else "")
+            sarif_results.append({"ruleId": label, "level": SEV_SARIF[sev],
+                                  "message": {"text": message},
+                                  "locations": [{"physicalLocation": location}]})
+    root = uri_of(stats.get("Scanned folder"))
+    doc = {
+        "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {"driver": {"name": "ScanBackDoors", "version": VERSION,
+                                "rules": [rules[k] for k in rules]}},
+            "originalUriBaseInfos": [{"id": "%SRCROOT%", "uri": root}] if root else [],
+            "artifacts": artifacts,
+            "results": sarif_results,
+        }],
+    }
+    with io.open(path, "w", encoding="utf-8", errors="replace") as f:
+        json.dump(doc, f, ensure_ascii=False, indent=1)
+
+
 def col_letter(n):
     s = ""
     while n > 0:
@@ -1381,6 +1428,7 @@ def build_parser():
     ap.add_argument("--no-csv", action="store_true", help="do not create the CSV")
     ap.add_argument("--xlsx", help="additionally save the report as XLSX")
     ap.add_argument("--json", help="save the full report as JSON")
+    ap.add_argument("--sarif", help="save the report as SARIF 2.1.0 (for CI code scanning)")
     ap.add_argument("--since", help="only files modified later than: 2026-09-01 or 14d (last 14 days)")
     ap.add_argument("--only-critical", action="store_true", help="search only for [CRITICAL]")
     ap.add_argument("--no-warnings", action="store_true", help="do not search for [WARNING]")
@@ -1457,7 +1505,7 @@ def main(argv=None):
         base_dirs = baseline_dir_set(args.baseline_dir)
         print("  baseline .php files: %d" % len(baseline))
 
-    out_files = [p for p in (args.csv, args.json, args.xlsx) if p]
+    out_files = [p for p in (args.csv, args.json, args.sarif, args.xlsx) if p]
     skip_paths = set(os.path.abspath(p) for p in out_files)
     skip_paths.add(os.path.abspath(__file__))     # the script itself contains all the signatures
 
@@ -1610,6 +1658,10 @@ def main(argv=None):
             write_json(args.json, results, stats)
             print("JSON: %s" % os.path.abspath(args.json))
             emit("FILE", "json " + os.path.abspath(args.json))
+        if args.sarif:
+            write_sarif(args.sarif, results, stats)
+            print("SARIF: %s" % os.path.abspath(args.sarif))
+            emit("FILE", "sarif " + os.path.abspath(args.sarif))
     except Exception as e:
         print("Could not write the report:", e)
 

@@ -164,12 +164,14 @@ python3 scan_backdoors.py . --no-warnings --min-score 10
 | `--no-csv` | | Do not create the CSV. |
 | `--xlsx PATH` | off | Additionally save the report as Excel (sheets Files, Hits, Summary). |
 | `--json PATH` | off | Full report as JSON (for scripts and automation). |
+| `--sarif PATH` | off | Report as SARIF 2.1.0 for CI code scanning (GitHub, Azure DevOps, CodeQL upload). |
 | `--max-matches N` | `60` | Maximum findings of one level per file in the report. The overall counters include all findings. |
 
 ```bash
 python3 scan_backdoors.py . --csv /tmp/scan.csv
 python3 scan_backdoors.py . --xlsx report.xlsx --json report.json
 python3 scan_backdoors.py . --no-csv --json report.json
+python3 scan_backdoors.py . --no-csv --sarif report.sarif
 python3 scan_backdoors.py . --max-matches 20
 ```
 
