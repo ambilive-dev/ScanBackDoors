@@ -377,6 +377,9 @@ The GUI needs a scanner that can report machine-readable progress (`--progress-l
 introduced with scanner 2.1); with an older one it still works and warns that exact
 progress is unavailable. Run `--version` on any of the three scripts to see what you have.
 
+A release ships `sha256sums.txt` alongside the zip with the zip's SHA-256 (verify with
+`Get-FileHash -Algorithm SHA256` on Windows or `sha256sum -c sha256sums.txt` on Linux).
+
 ## Development
 
 The test suite needs nothing but Python - no pytest, no network, no real site:
