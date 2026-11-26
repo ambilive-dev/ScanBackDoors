@@ -30,10 +30,26 @@ WHITELIST = os.path.join(DATA, "whitelist-known-clean.txt")
 PYTHON = sys.executable
 ENV = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1", PYTHONUNBUFFERED="1")
 
-# printed when a sample never reached the scanner
-AV_HINT = ("a planted sample disappeared before the scanner could read it - real-time "
-           "protection is quarantining the fixture. Add %s to your antivirus exclusions "
-           "or set SBD_FIXTURE_ROOT to an excluded folder." % os.path.join(tempfile.gettempdir(), "sbd-fixtures"))
+# printed when a test file never reached the tool that needed it
+AV_HINT = ("a test file disappeared or could not be read - real-time protection is "
+           "quarantining it. All test data (sites, reports, quarantine copies) lives "
+           "under one folder: add %s to your antivirus exclusions, or set "
+           "SBD_FIXTURE_ROOT to an excluded folder." % os.path.join(tempfile.gettempdir(), "sbd-fixtures"))
+
+
+def workdir(prefix):
+    """Throw-away directory under the fixtures root.
+
+    Every file a test produces - sites, reports, quarantine copies - lives under the
+    single stable fixtures root, so an antivirus exclusion only ever has to cover
+    that one folder.
+    """
+    return tempfile.mkdtemp(prefix=prefix, dir=fx.fixtures_root())
+
+
+def workfile(prefix, suffix):
+    """Temp file under the fixtures root (same reason as workdir())."""
+    return tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=fx.fixtures_root())
 
 
 def tool_path(script):
@@ -74,7 +90,8 @@ def scan(site, *args, **kw):
     """Run the scanner with --json and return (result, parsed report)."""
     json_path = kw.pop("json", None)
     if json_path is None:
-        fd, json_path = tempfile.mkstemp(suffix=".json", prefix="sbd-report-")
+        fd, json_path = tempfile.mkstemp(suffix=".json", prefix="sbd-report-",
+                                         dir=fx.fixtures_root())
         os.close(fd)
         os.remove(json_path)        # the scanner must create it; it creates no file on a startup error
     cmd = [site, "--no-progress", "--no-csv", "--workers", kw.pop("workers", "1"), "--json", json_path]

@@ -13,7 +13,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -83,7 +82,7 @@ class VersionTest(unittest.TestCase):
 
     def test_a_single_script_without_version_py_still_starts(self):
         """The CLI scanner is uploaded to servers as one file: the fallback must work."""
-        keep = tempfile.mkdtemp(prefix="sbd-single-")
+        keep = h.workdir("sbd-single-")
         try:
             for script in ("scan_backdoors.py", "clean_malware.py"):
                 shutil.copy2(os.path.join(h.SRC, script), keep)

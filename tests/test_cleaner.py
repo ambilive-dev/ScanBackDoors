@@ -12,7 +12,6 @@ import json
 import os
 import shutil
 import sys
-import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -48,7 +47,7 @@ def bad_site(name):
 class PlanTest(unittest.TestCase):
     def test_dry_run_plans_the_bad_file(self):
         site = bad_site("cleaner-plan")
-        report_dir = tempfile.mkdtemp(prefix="sbd-clean-")
+        report_dir = h.workdir("sbd-clean-")
         report = os.path.join(report_dir, "cleanup.csv")
         res = h.run("clean_malware.py", [site, "--report", report], cwd=report_dir)
         self.assertEqual(res.returncode, 0)
@@ -59,7 +58,7 @@ class PlanTest(unittest.TestCase):
     def test_dry_run_changes_nothing(self):
         site = bad_site("cleaner-dry")
         tree_before = h.tree_hashes(site)
-        report_dir = tempfile.mkdtemp(prefix="sbd-clean-")
+        report_dir = h.workdir("sbd-clean-")
         report = os.path.join(report_dir, "cleanup.csv")
         res = h.run("clean_malware.py", [site, "--report", report], cwd=report_dir)
         self.assertEqual(res.returncode, 0)
@@ -72,7 +71,7 @@ class ApplyTest(unittest.TestCase):
 
     def test_apply_strips_the_htaccess_and_quarantines_the_original(self):
         site = bad_site("cleaner-apply")
-        report_dir = tempfile.mkdtemp(prefix="sbd-clean-")
+        report_dir = h.workdir("sbd-clean-")
         report = os.path.join(report_dir, "cleanup.csv")
         qdir = os.path.join(report_dir, "quarantine")
         original = h.sha256(os.path.join(site, ".htaccess"))
@@ -98,7 +97,7 @@ class ApplyTest(unittest.TestCase):
 
     def test_restore_put_the_original_back(self):
         site = bad_site("cleaner-restore")
-        report_dir = tempfile.mkdtemp(prefix="sbd-clean-")
+        report_dir = h.workdir("sbd-clean-")
         report = os.path.join(report_dir, "cleanup.csv")
         qdir = os.path.join(report_dir, "quarantine")
         original = h.sha256(os.path.join(site, ".htaccess"))
@@ -116,7 +115,7 @@ class ApplyTest(unittest.TestCase):
 
     def test_delete_removes_the_file_with_no_quarantine(self):
         site = bad_site("cleaner-delete")
-        report_dir = tempfile.mkdtemp(prefix="sbd-clean-")
+        report_dir = h.workdir("sbd-clean-")
         report = os.path.join(report_dir, "cleanup.csv")
         qdir = os.path.join(report_dir, "quarantine")
         res = h.run("clean_malware.py",
@@ -146,7 +145,7 @@ class SafetyTest(unittest.TestCase):
     def test_quarantine_inside_the_site_is_refused(self):
         site = bad_site("cleaner-inside")
         qdir = os.path.join(site, "_quarantine_inside")
-        report_dir = tempfile.mkdtemp(prefix="sbd-clean-")
+        report_dir = h.workdir("sbd-clean-")
         res = h.run("clean_malware.py",
                     [site, "--apply", "--report", os.path.join(report_dir, "cleanup.csv"),
                      "--quarantine-dir", qdir], cwd=report_dir)
@@ -156,7 +155,7 @@ class SafetyTest(unittest.TestCase):
     def test_unknown_family_is_refused(self):
         site = bad_site("cleaner-family")
         res = h.run("clean_malware.py",
-                    [site, "--families", "not-a-family"], cwd=tempfile.mkdtemp(prefix="sbd-clean-"))
+                    [site, "--families", "not-a-family"], cwd=h.workdir("sbd-clean-"))
         self.assertEqual(res.returncode, 1)
         self.assertIn("Unknown family", res.out)
 
@@ -175,7 +174,7 @@ class BackdoorFamilyTest(unittest.TestCase):
         target = os.path.join(site, *rel.split("/"))
         if not os.path.isfile(target):
             raise unittest.SkipTest("the backdoor sample could not be created: %s" % h.AV_HINT)
-        report_dir = tempfile.mkdtemp(prefix="sbd-clean-")
+        report_dir = h.workdir("sbd-clean-")
         report = os.path.join(report_dir, "cleanup.csv")
         qdir = os.path.join(report_dir, "quarantine")
         # a dry run first: if the cleaner cannot read the file, it is simply

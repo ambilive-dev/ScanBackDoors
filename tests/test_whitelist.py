@@ -5,7 +5,6 @@ import io
 import os
 import re
 import sys
-import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -93,7 +92,7 @@ class AllowlistFormatTest(unittest.TestCase):
     """--whitelist format: hashes, folders, masks; '#' starts a comment."""
 
     def parse(self, text):
-        fd, path = tempfile.mkstemp(suffix=".txt", prefix="sbd-wl-")
+        fd, path = h.workfile("sbd-wl-", ".txt")
         os.close(fd)
         try:
             with io.open(path, "w", encoding="utf-8") as f:

@@ -6,7 +6,6 @@ import io
 import json
 import os
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
@@ -22,7 +21,7 @@ def load_json(path):
 class OutputContractTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.tmp = tempfile.mkdtemp(prefix="sbd-reports-")
+        cls.tmp = h.workdir("sbd-reports-")
         cls.site = fx.build("planted-reports", planted=True, binaries=True)
         cls.present, _vanished = fx.wait_readables(cls.site, list(fx.PLANTED))
         if len(cls.present) < 3:
@@ -134,7 +133,7 @@ class WhitelistBehaviourTest(unittest.TestCase):
             raise unittest.SkipTest("all planted samples were blocked by antivirus: %s" % h.AV_HINT)
         key = self.readable[0].lower().replace("\\", "/")
         sha = hashlib.sha256(fx.payload(fx.PLANTED[self.readable[0]]["payload"])).hexdigest()
-        wl = os.path.join(tempfile.mkdtemp(prefix="sbd-wl-"), "wl.txt")
+        wl = os.path.join(h.workdir("sbd-wl-"), "wl.txt")
         with io.open(wl, "w", encoding="utf-8") as f:
             f.write("%s\n" % sha)
         res_wl, report_wl = h.scan(self.site, "--whitelist", wl)
@@ -147,7 +146,7 @@ class WhitelistBehaviourTest(unittest.TestCase):
     def test_path_whitelist_suppresses_a_whole_folder(self):
         target = self.present[0]
         folder = target.split("/")[0]
-        wl = os.path.join(tempfile.mkdtemp(prefix="sbd-wl-"), "wl.txt")
+        wl = os.path.join(h.workdir("sbd-wl-"), "wl.txt")
         with io.open(wl, "w", encoding="utf-8") as f:
             f.write("%s/\n" % folder)
         _res, report = h.scan(self.site, "--whitelist", wl)

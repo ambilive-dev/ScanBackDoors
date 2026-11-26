@@ -9,7 +9,6 @@ synthetic site, so it works without a real Joomla installation.
 import json
 import os
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
@@ -28,7 +27,7 @@ class VersionTest(unittest.TestCase):
 
 class BootTest(unittest.TestCase):
     def test_the_gui_boots_and_answers_ping(self):
-        home = tempfile.mkdtemp(prefix="sbd-gui-")
+        home = h.workdir("sbd-gui-")
         with h.Gui(home) as gui:
             ping = gui.api("GET", "/api/ping")
             self.assertEqual(ping["version"], h.bundle_version())
@@ -37,7 +36,7 @@ class BootTest(unittest.TestCase):
     def test_the_api_requires_the_gui_header(self):
         # /api/ping is a lightweight health check and is deliberately exempt;
         # the guarded routes must reject a request without the header.
-        home = tempfile.mkdtemp(prefix="sbd-gui-")
+        home = h.workdir("sbd-gui-")
         with h.Gui(home) as gui:
             for bad in ({"X-Requested-With": ""}, {"X-Requested-With": "wrong"}):
                 with self.assertRaises(h.ApiError) as cm:
@@ -47,14 +46,14 @@ class BootTest(unittest.TestCase):
 
 class SettingsTest(unittest.TestCase):
     def test_settings_default_to_the_shipped_scanner(self):
-        home = tempfile.mkdtemp(prefix="sbd-gui-")
+        home = h.workdir("sbd-gui-")
         with h.Gui(home) as gui:
             settings = gui.settings()
             self.assertTrue(os.path.isfile(settings["scanner_path"]))
             self.assertEqual(os.path.basename(settings["scanner_path"]), "scan_backdoors.py")
 
     def test_settings_are_saved_into_the_isolated_home(self):
-        home = tempfile.mkdtemp(prefix="sbd-gui-")
+        home = h.workdir("sbd-gui-")
         site_dir = os.path.join(home, "site")
         os.makedirs(site_dir)
         with h.Gui(home) as gui:
@@ -72,7 +71,7 @@ class SettingsTest(unittest.TestCase):
             before = os.path.getmtime(real)
         except OSError:
             before = None
-        home = tempfile.mkdtemp(prefix="sbd-gui-")
+        home = h.workdir("sbd-gui-")
         with h.Gui(home) as gui:
             gui.api("POST", "/api/settings",
                     {"settings": {"site_dir": os.path.join(home, "site")}})
@@ -88,7 +87,7 @@ class ScanTest(unittest.TestCase):
     """The GUI launches the real scanner against the synthetic site."""
 
     def test_scan_finishes_with_critical_findings(self):
-        home = tempfile.mkdtemp(prefix="sbd-gui-")
+        home = h.workdir("sbd-gui-")
         site = fx.build("gui-planted", planted=True)
         present, _vanished = fx.wait_readables(site, list(fx.PLANTED))
         if len(present) < 2:
@@ -105,7 +104,7 @@ class ScanTest(unittest.TestCase):
         self.assertIn("Files scanned", status)
 
     def test_scan_of_a_clean_site_reports_no_critical_findings(self):
-        home = tempfile.mkdtemp(prefix="sbd-gui-")
+        home = h.workdir("sbd-gui-")
         site = fx.build("gui-clean", planted=False)
         csv_path = os.path.join(home, "report.csv")
         with h.Gui(home) as gui:
