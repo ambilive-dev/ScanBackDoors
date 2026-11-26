@@ -7,20 +7,23 @@ Only Python 3.6+ is required, nothing needs to be installed (no Tk, no pip). No 
 
 | Component | Version | What it is |
 |---|---|---|
-| `src/scan_backdoors.py` | 2.1 | The scanner: signatures, baseline diff against a clean Joomla, multi-processing, CSV/JSON/XLSX reports |
-| `src/scan_backdoors_gui.py` | 3.0 | Browser-based GUI: a local web server on 127.0.0.1 plus one page (scan, findings, quarantine, mass cleanup) |
-| `src/clean_malware.py` | 1.0 | Mass cleanup of known malware families, with quarantine and core-file restore from a clean distribution |
+| `src/scan_backdoors.py` | 3.1 | The scanner: signatures, baseline diff against a clean Joomla, multi-processing, CSV/JSON/XLSX reports |
+| `src/scan_backdoors_gui.py` | 3.1 | Browser-based GUI: a local web server on 127.0.0.1 plus one page (scan, findings, quarantine, mass cleanup) |
+| `src/clean_malware.py` | 3.1 | Mass cleanup of known malware families, with quarantine and core-file restore from a clean distribution |
 
-Released versions are tagged (see [CHANGELOG.md](CHANGELOG.md)). The scanner and the GUI are versioned separately: the GUI needs scanner 2.1 or newer and prints a warning if it is older.
+The three components are one product and carry one version, written once in
+[`src/version.py`](src/version.py). `--version` on any of them prints the same number, so
+`scan_backdoors_gui.py --version` tells you which release you are actually running.
 
 ## Repository layout
 
 ```
 start.bat                     Windows launcher (double-click)
-src/                          the three scripts; they must stay in one folder
+src/                          the three scripts + version.py; they must stay in one folder
 assets/                       logo PNG and the .ico for a desktop shortcut
 data/                         known-clean hash allowlist (see below)
 docs/                         Russian manual (docs/README_RU.md)
+tests/                        test suite: synthetic sites, planted samples, CI
 ```
 
 ## Known-clean allowlist
@@ -334,11 +337,40 @@ Safeguards: the site and baseline versions must match (otherwise it refuses); if
 
 ## Versioning
 
-The scanner, the GUI and the cleaner keep their own `VERSION` and are released
-together under one tag (`v3.0` = GUI 3.0 with scanner 2.1 and cleaner 1.0).
-The GUI refuses nothing when the scanner is older than it expects: it warns that
-exact progress is unavailable. Run `--version` on any of the three scripts to
-see what you have.
+One version for the whole bundle, written once in `src/version.py`; a release is
+a tag with that number (`v3.1` = scanner 3.1, GUI 3.1, cleaner 3.1). Each script
+keeps the same number as a fallback literal, because the scanner is routinely
+uploaded to a server as a single file - a test compares the fallbacks with
+`version.py`, so they cannot drift apart.
+
+The GUI needs a scanner that can report machine-readable progress (`--progress-lines`,
+introduced with scanner 2.1); with an older one it still works and warns that exact
+progress is unavailable. Run `--version` on any of the three scripts to see what you have.
+
+## Development
+
+The test suite needs nothing but Python - no pytest, no network, no real site:
+
+```
+python -m unittest discover -s tests -v        # everything
+python -m unittest tests.test_scanner     # one module
+```
+
+It builds two synthetic sites in a fixture folder - a legitimate Joomla-like tree
+that must produce no findings at all, and the same tree with planted backdoors that
+must produce exactly the expected signatures and severities - then covers the
+cleaner's plan → apply → restore cycle (including "a dry run changes nothing"),
+the exit codes and report formats, the allowlist dataset, and the GUI driven
+through its own HTTP API on a private port with a private settings file.
+
+The malicious samples are stored in `tests/payloads/*.b64` (base64 plus a
+description) so that a clone of this repository is not a folder full of copy-paste
+web shells; `python tests/seal_payloads.py --show filefuns.php` prints any of them.
+They are unsealed only into the fixture folder while a test runs - which is where
+real-time antivirus sometimes deletes them: the suite detects that, says which
+sample vanished and how to exclude the folder, rather than reporting a missed
+backdoor. `.github/workflows/ci.yml` runs the suite on Linux and Windows across
+supported Python versions.
 
 ## Why no dependencies
 
@@ -352,7 +384,8 @@ reason. Adding a dependency needs to beat that property, not just look tidier.
 The most useful contributions are false positives: an entry for
 `data/whitelist-known-clean.txt` (a SHA-256 plus one line on why the file is
 clean), or a signature for a family the scanner does not yet know. Keep the code
-compatible with Python 3.6 and free of third-party packages.
+compatible with Python 3.6, free of third-party packages, and run
+`python -m unittest discover -s tests` before a pull request.
 
 ## License
 

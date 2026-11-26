@@ -34,7 +34,10 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 APP_ID = "scan_backdoors_gui"
-VERSION = "3.0"
+try:                                       # single source of truth: version.py next to this file
+    from version import VERSION, MIN_SCANNER
+except ImportError:                        # the GUI is useless without the scanner, but never crash on import
+    VERSION, MIN_SCANNER = "3.1", "2.1"    # keep in sync with src/version.py (tests/test_release.py checks it)
 DEFAULT_PORT = 8765
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = Path.home() / ".scan_backdoors_gui.json"
@@ -644,7 +647,7 @@ class App(object):
             self.log_add("\n" + "=" * 76 + "\nCommand: " + subprocess.list2cmdline(cmd) + "\n\n")
             if not markers:
                 self.log_add("WARNING: old scanner version (no --progress-lines), exact progress is unavailable. "
-                             "Update scan_backdoors.py to 2.1.\n\n")
+                             "Update scan_backdoors.py to %s or newer.\n\n" % MIN_SCANNER)
         threading.Thread(target=self._run_job, args=(cmd,), daemon=True).start()
 
     def start_scan(self):
@@ -2015,6 +2018,7 @@ def main(argv=None):
     ap.add_argument("--port", type=int, default=DEFAULT_PORT,
                     help="port on 127.0.0.1 (default %d; keep it fixed to use a bookmark)" % DEFAULT_PORT)
     ap.add_argument("--no-browser", action="store_true", help="do not open the browser")
+    ap.add_argument("--version", action="version", version=APP_ID + " " + VERSION)
     args = ap.parse_args(argv)
     if hasattr(sys.stdout, "reconfigure"):
         try:

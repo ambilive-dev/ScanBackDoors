@@ -7,6 +7,10 @@ report-data.csv
 report-*.csv
 report-*.json
 report-*.xlsx
+cleanup-report.csv
+
+# the GUI's own settings file, kept next to the home directory, never in the repo
+.scan_backdoors_gui.json
 
 # whitelist the GUI writes by default (next to scan_backdoors.py)
 src/whitelist.txt

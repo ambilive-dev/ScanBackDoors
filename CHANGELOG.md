@@ -1,24 +1,28 @@
 # Changelog
 
-All notable changes to this project are documented here. Versions of the three
-components are tagged together as one release; the components themselves carry
-independent `VERSION` values (see the table in the README).
+All notable changes to this project are documented here. The bundle has one
+version for all three components; it is written once in `src/version.py` and a
+release is a tag with that number.
 
-## Unreleased
+## v3.1 — 2026-11-26
 
-- Repository layout: the three scripts moved to `src/`, the logo and icon to
-  `assets/`, the Russian manual to `docs/`, the known-clean allowlist to `data/`.
-  `start.bat` stays in the project root and launches `src\scan_backdoors_gui.py`.
-- Published `data/whitelist-known-clean.txt`: 3 571 SHA-256 hashes of legitimate
-  third-party files (TCPDF, Akeeba `phpfinder`, VirtueMart `vrequest.php`,
-  RSFirewall/Komento helpers, `.phar` pubkeys) with a note per entry on why it is
-  clean. Collected during real cleanups; contains no site names or paths outside
-  the extension folders.
-- Added `LICENSE` (MIT), `SECURITY.md` and this file.
-- README aligned with the versions that actually ship (scanner 2.1, GUI 3.0,
-  cleaner 1.0) instead of the old "2.1 parameter reference" title.
-- To settle in the next release: the tag message of 2026-10-14 says "v2.1.1"
-  while `scan_backdoors.py` reports `VERSION = "2.1"`.
+- One version for the bundle: `src/version.py` is the only place the number is
+  written, the scanner, the GUI and the cleaner import it. They keep the same
+  value as a fallback literal so that a lone `scan_backdoors.py` uploaded to a
+  server still starts; a test compares the fallbacks with `version.py`.
+- `scan_backdoors_gui.py --version` exists (`scan_backdoors_gui 3.1`), like the
+  other two scripts. `python start.bat` and the browser page show the same number.
+- The scanner and the cleaner, which used to carry `2.1` and `1.0`, now report the
+  bundle version too. The version mismatch between the tag of 2026-10-14 ("v2.1.1")
+  and `VERSION = "2.1"` in the file is gone with this.
+- Test suite in `tests/`, stdlib `unittest` only: synthetic clean and infected
+  sites, the signature and severity each planted sample must produce, "a dry run
+  changes nothing" and the plan → apply → restore cycle of the cleaner, exit codes
+  and report formats, the allowlist dataset, the GUI over its HTTP API, and
+  release hygiene (one version, documented flags, nothing private in the tree).
+  Malicious samples live in `tests/payloads/*.b64` and are unsealed only into a
+  temporary fixture folder.
+- `.github/workflows/ci.yml`: the suite on Linux and Windows on Python 3.8/3.11/3.13.
 
 ## v3.0 — 2026-10-19
 

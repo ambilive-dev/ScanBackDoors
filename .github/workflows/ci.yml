@@ -1,0 +1,44 @@
+name: CI
+
+"on":
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: tests (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.8", "3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # The planted samples in the fixtures are inert synthetic files, but
+      # real-time protection on a workstation may quarantine them between the
+      # moment the fixture is written and the moment the tests read it. Ask
+      # the anti-virus to leave the fixtures folder alone; if the exclusion
+      # cannot be added, the tests still run - the samples that really are
+      # missing are reported as skipped, with the antivirus hint, rather than
+      # as a detector failure.
+      - name: Exclude the fixtures folder from antivirus
+        if: runner.os == 'Windows'
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $root = Join-Path $env:TEMP "sbd-fixtures"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          Add-MpPreference -ExclusionPath $root
+
+      - name: Run the test suite
+        run: python -m unittest discover -s tests -v
