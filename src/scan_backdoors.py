@@ -122,6 +122,9 @@ MALWARE_NAMES = {"chtmlfuns.php", "cjfuns.php", "classsmtps.php",
 SHELL_NAMES = {"shell", "c99", "c100", "r57", "r58", "wso", "wsoshell", "b374k", "alfa", "cmd",
                "bypass", "hack", "hacked", "backdoor", "webshell", "filesman", "indoxploit",
                "priv8", "sh3ll", "symlink", "leafmailer", "tinyfilemanager", "fm"}
+# classic shell families that ship with version suffixes (c99_madnet.php, r57shell.php, ...):
+# a stem that STARTS with one of these is a shell, cross-checked against backdoor lists
+SHELL_NAME_PREFIXES = ("c99", "r57", "b374k")
 
 # Where PHP must not exist
 STRICT_DIRS = {"images", "tmp"}
@@ -144,20 +147,27 @@ DISGUISE_RE = re.compile(
 # 2) SIGNATURES:  S(severity, label, regex, kinds, weight, flags)
 #    kinds: php | js | html | htaccess | ini | text
 #    weight: points given for a finding (default 10 / 3 / 1)
+#    raw:    match the RAW text, not the comment-masked one (signals that live
+#             INSIDE comments, like a plugin header)
 # ---------------------------------------------------------------------------
 
 SIGS_BY_KIND = {}
 
 
-def S(sev, label, pattern, kinds, weight=None, flags=0, at_end=False):
+def S(sev, label, pattern, kinds, weight=None, flags=0, at_end=False, raw=False):
     rx = re.compile(pattern, flags)
     w = DEFAULT_WEIGHT[sev] if weight is None else weight
     for k in kinds.split():
-        SIGS_BY_KIND.setdefault(k, []).append((sev, label, rx, w, at_end))
+        SIGS_BY_KIND.setdefault(k, []).append((sev, label, rx, w, at_end, raw))
 
 
 C, O, W = SEV_CRIT, SEV_OBF, SEV_WARN
 RQ = r"\$_(?:POST|GET|REQUEST|COOKIE)"
+# a superglobal read assigned to a local variable (optionally through one decode step):
+#   $cmd = $_GET['c'];            $cmd = base64_decode($_POST['c']);
+TAINT_SRC = (r"(?:\s*" + RQ + r"\s*\[\s*['\"][^'\"]+['\"]\s*\]"
+             r"|\s*(?:base64_decode|urldecode|rawurldecode|strrev)\s*\(\s*"
+             + RQ + r"\s*\[\s*['\"][^'\"]+['\"]\s*\]\s*\))")
 
 # WordPress core folders: file management and a diff engine literally named
 # shell.php ship there, so the FM/webshell-name heuristics are gated off for them
@@ -179,6 +189,12 @@ S(C, "backticks with request data", r"`[^`\n]{0,200}" + RQ + r"[^`\n]{0,200}`", 
 S(C, "base64_decode(request data)", r"\bbase64_decode\s*\(\s*@?\s*" + RQ, "php", 25)
 S(C, "unserialize(request data)", r"\bunserialize\s*\(\s*(?:@?\s*base64_decode\s*\(\s*)?@?\s*" + RQ, "php", 25)
 S(C, "file write with request data", r"\b(?:file_put_contents|fwrite|fputs)\s*\([^;\n]{0,150}" + RQ, "php")
+# the destination path itself comes from the request (uploader / arbitrary write)
+S(C, "file write/copy to a path from request data", r"\b(?:copy|rename|move_uploaded_file|link|symlink|touch|unlink|chmod|mkdir|rmdir)\s*\([^;\n]{0,200}?" + RQ + r"\s*\[\s*['\"][^'\"]+['\"]\s*\]\s*[,)]", "php", 25)
+# the file to open comes straight from the request (LFI / directory listing shell)
+S(C, "file read with request data (opendir/fopen/readfile/file)", r"\b(?:opendir|fopen|readfile|file_get_contents|file)\s*\(\s*@\s*" + RQ + r"\s*\[\s*['\"][^'\"]+['\"]\s*\]", "php", 25)
+# command lands in a local variable and a sink executes it (token-gated webshells do exactly this)
+S(C, "exec sink fed by a variable from request data", r"(\$[\w]+)\s*=\s*@?" + TAINT_SRC + r"\s*;[\s\S]{0,300}?\b(?:system|exec|shell_exec|passthru|popen|proc_open|eval|assert|include|require(?:_once)?)\s*\(\s*@?\s*\1", "php", 25)
 S(C, "preg_replace /e modifier", r"\bpreg_replace\s*\(\s*(['\"])([/#~|@!%])[^'\"\n]{0,200}?\2[a-z]{0,5}e[a-z]{0,5}\1", "php")
 S(C, "preg_replace_callback + payload", r"\bpreg_replace_callback\s*\(.{0,200}(?:base64_decode|" + RQ + ")", "php")
 S(C, "create_function", r"\bcreate_function\s*\(", "php")
@@ -191,6 +207,16 @@ S(O, "function call via computed array index $a[6 + 4](...)", r"\$\w+\s*\[\s*\d+
 S(O, "nested md5(md5(md5(...))) (hard-coded backdoor password check)", r"\bmd5\s*\(\s*md5\s*\(\s*md5\s*\(", "php", 8)
 S(O, "dynamic variable ${$ / ${' (escaped \\$ in a string is NOT one)", r"(?<!\\)\$\{\s*[\$'\"]", "php", 3)
 S(C, "dynamic variable from a superglobal (${$_GET / ${$_POST ...)", r"(?<!\\)\$\{\s*" + RQ, "php", 25)
+# token check against the request: the classic gate of a webshell (?t=<hash>).
+# On WordPress this is the NORMAL nonce check (wp_verify_nonce -> hash_equals),
+# so like the harvester it is gated off on detected WP sites.
+TOKEN_GATE_LABEL = "hash_equals() comparing against request data (token-gated backdoor)"
+S(O, TOKEN_GATE_LABEL, r"\bhash_equals\s*\([^;{\n]{0,150}?" + RQ, "php", 8)
+# a variable from the request goes into a file function (read/write/list via LFI)
+S(O, "file function fed by a variable from request data", r"(\$[\w]+)\s*=\s*@?" + TAINT_SRC + r"\s*;[\s\S]{0,300}?\b(?:fopen|opendir|readfile|file_get_contents|file_put_contents|file|copy|rename|move_uploaded_file|unlink|chmod|touch)\s*\(\s*[^;{\n]{0,80}?\1\b", "php", 8)
+# the impersonation header sits in the plugin docblock - a PHP comment, so this
+# one runs over the raw text
+S(O, "plugin header claims 'WordPress.org Community' authorship (impersonation)", r"Author\s*:\s*WordPress\.org\s+Community", "php", 10, re.I, raw=True)
 S(C, "known webshell signature", r"\bFilesMan\b|c99shell|r57shell|\bb374k\b|Mini\s*Shell|\bPriv8\b|IndoXploit|Alfa\s*Team|AnonymousFox|\bWSO\s*\d|Sh3ll\b|\bHacked\s+by\b", "php js html text", 30, re.I)
 S(C, "Tiny File Manager / webshell", r"tinyfilemanager|embedded_pass_hash|fm_clean_path|H3K\s*\|\s*Tiny", "php html", 30, re.I)
 S(C, "malware tag <script id='sggtp'>", r"<script[^>]*\bid\s*=\s*['\"]?sggtp", "php js html text", 30, re.I)
@@ -320,7 +346,7 @@ def name_checks(name, low):
         stem = low.split(".")[0]
     if re.search(r"\s", name):
         notes.append((O, 0, "whitespace in filename", name, 5))
-    if stem in SHELL_NAMES:
+    if stem in SHELL_NAMES or any(stem.startswith(p) for p in SHELL_NAME_PREFIXES):
         notes.append((C, 0, "typical webshell filename", name, 25))
     if low in MALWARE_NAMES:
         notes.append((O, 0, "filename from a known malicious .htaccess allow-list", name, 10))
@@ -515,13 +541,16 @@ def scan_text(text, kinds, enabled):
         # true positive and must keep firing on the raw text).
         sigs_text = mask_php_comments(text)
     for kind in kinds:
-        for sev, label, rx, w, at_end in SIGS_BY_KIND.get(kind, ()):
+        for sev, label, rx, w, at_end, raw in SIGS_BY_KIND.get(kind, ()):
             if sev not in enabled:
                 continue
-            if label == HARVEST_C12_LABEL and CFG.get("cms") == "wp":
+            # legitimate on a WordPress site (nonce verification, login flows):
+            # these heuristics only make sense as standalone tells on non-WP
+            if label in (HARVEST_C12_LABEL, TOKEN_GATE_LABEL) and CFG.get("cms") == "wp":
                 continue
+            hay = text if raw else sigs_text
             n = 0
-            for m in rx.finditer(sigs_text):
+            for m in rx.finditer(hay):
                 n += 1
                 if n > PATTERN_CAP:
                     break
@@ -862,6 +891,10 @@ def location_hits(rel, name, size, head):
         return [(C, 0, "PHP file in /%s/ without Joomla die() header" % parts[-1 if first == "administrator" else 0], rel, 15)]
     if first == "media":
         return [(O, 0, "PHP file in /media/", rel, 6)]
+    # the July-2026 wp2shell campaign drops plugins named <name>-<6 hex digits>;
+    # real plugin slugs end in a version (1.2.3), never in a bare hex id
+    if re.match(r"wp-content/(?:plugins|mu-plugins)/[^/\\]+-[0-9a-fA-F]{6}[/\\]", rel):
+        return [(O, 0, "plugin folder named like a campaign drop (<name>-<6 hex> suffix)", rel, 8)]
     if any(p in STRICT_DIRS for p in parts):
         return [(O, 0, "PHP file inside an images/tmp subfolder", rel, 8)]
     return []
