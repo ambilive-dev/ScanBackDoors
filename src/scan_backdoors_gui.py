@@ -37,7 +37,7 @@ APP_ID = "scan_backdoors_gui"
 try:                                       # single source of truth: version.py next to this file
     from version import VERSION, MIN_SCANNER
 except ImportError:                        # the GUI is useless without the scanner, but never crash on import
-    VERSION, MIN_SCANNER = "3.1", "2.1"    # keep in sync with src/version.py (tests/test_release.py checks it)
+    VERSION, MIN_SCANNER = "3.1.1", "2.1"  # keep in sync with src/version.py (tests/test_release.py checks it)
 DEFAULT_PORT = 8765
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = Path.home() / ".scan_backdoors_gui.json"

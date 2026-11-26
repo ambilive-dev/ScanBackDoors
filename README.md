@@ -7,9 +7,9 @@ Only Python 3.6+ is required, nothing needs to be installed (no Tk, no pip). No 
 
 | Component | Version | What it is |
 |---|---|---|
-| `src/scan_backdoors.py` | 3.1 | The scanner: signatures, baseline diff against a clean Joomla, multi-processing, CSV/JSON/XLSX reports |
-| `src/scan_backdoors_gui.py` | 3.1 | Browser-based GUI: a local web server on 127.0.0.1 plus one page (scan, findings, quarantine, mass cleanup) |
-| `src/clean_malware.py` | 3.1 | Mass cleanup of known malware families, with quarantine and core-file restore from a clean distribution |
+| `src/scan_backdoors.py` | 3.1.1 | The scanner: signatures, baseline diff against a clean Joomla, multi-processing, CSV/JSON/XLSX reports |
+| `src/scan_backdoors_gui.py` | 3.1.1 | Browser-based GUI: a local web server on 127.0.0.1 plus one page (scan, findings, quarantine, mass cleanup) |
+| `src/clean_malware.py` | 3.1.1 | Mass cleanup of known malware families, with quarantine and core-file restore from a clean distribution |
 
 The three components are one product and carry one version, written once in
 [`src/version.py`](src/version.py). `--version` on any of them prints the same number, so

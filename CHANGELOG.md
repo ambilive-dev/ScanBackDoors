@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The bundle has one
 version for all three components; it is written once in `src/version.py` and a
 release is a tag with that number.
 
-## Unreleased
+## v3.1.1 — 2026-11-26
 
 - Hardening (cleaner): the hash check of a freshly written file - the quarantine
   copy after `--apply`, the replaced file after `--replace-core` - now retries

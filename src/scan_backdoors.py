@@ -34,7 +34,7 @@ from datetime import datetime
 try:                                       # single source of truth: version.py next to this file
     from version import VERSION
 except ImportError:                        # a single uploaded file still has to start
-    VERSION = "3.1"                        # keep in sync with src/version.py (tests/test_release.py checks it)
+    VERSION = "3.1.1"                      # keep in sync with src/version.py (tests/test_release.py checks it)
 
 # ---------------------------------------------------------------------------
 # 1) CONSTANTS

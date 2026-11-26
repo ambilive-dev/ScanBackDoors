@@ -58,7 +58,8 @@ def git(args):
 class VersionTest(unittest.TestCase):
     def test_version_is_written_once(self):
         """Only src/version.py holds the number; the scripts import it."""
-        self.assertRegex(VERSION, r"^\d+\.\d+$", "src/version.py must hold a plain N.N version")
+        self.assertRegex(VERSION, r"^\d+\.\d+(\.\d+)?$",
+                         "src/version.py must hold a plain N.N or N.N.P version")
         for script in SCRIPTS:
             text = read(os.path.join(h.SRC, script))
             self.assertIn("from version import VERSION", text,
