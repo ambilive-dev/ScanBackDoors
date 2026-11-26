@@ -1,0 +1,30 @@
+name: Bug
+description: Something went wrong while scanning or cleaning
+title: "Bug: "
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: Include the scanner output that looks wrong (log lines, report rows)
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: version
+    attributes:
+      label: Scanner version
+      description: Output of scan_backdoors.py --version
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: Exact command line and a minimal site structure, if it helps

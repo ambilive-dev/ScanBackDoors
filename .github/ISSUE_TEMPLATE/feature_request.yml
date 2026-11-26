@@ -1,0 +1,15 @@
+name: Feature request
+description: An idea for a new capability
+title: "Feature: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What is missing?
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why would it help?

@@ -1,0 +1,34 @@
+name: False positive
+description: The scanner flagged a file that is actually clean
+title: "False positive: "
+labels: [false-positive]
+body:
+  - type: textarea
+    id: file
+    attributes:
+      label: File path (relative to the site root)
+      description: For example templates/mytpl/helper.php
+      placeholder: templates/mytpl/helper.php
+    validations:
+      required: true
+  - type: textarea
+    id: hash
+    attributes:
+      label: SHA-256 of the file
+      description: Get-FileHash -Algorithm SHA256 <file> on Windows, sha256sum <file> on Linux
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why is it clean?
+      description: What the file does and why it is part of the site
+    validations:
+      required: true
+  - type: textarea
+    id: how
+    attributes:
+      label: How it was scanned
+      description: Output of scan_backdoors.py --version, the exact command line (flags), and whether a baseline or whitelist was used
+    validations:
+      required: true

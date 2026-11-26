@@ -133,6 +133,12 @@ class LayoutTest(unittest.TestCase):
         self.assertRegex(changelog, r"(?m)^#{2,}\s+v?%s(?:\s|---|[—–-]|\b)" % re.escape(VERSION),
                          "CHANGELOG.md must have a section for the shipped version")
 
+    def test_issue_templates_exist(self):
+        d = os.path.join(h.REPO, ".github", "ISSUE_TEMPLATE")
+        for name in ("config.yml", "false-positive.yml", "bug.yml", "feature_request.yml"):
+            self.assertTrue(os.path.isfile(os.path.join(d, name)), "%s is missing" % name)
+        self.assertIn("blank_issues_enabled: false", read(os.path.join(d, "config.yml")))
+
     def test_every_cli_flag_is_documented(self):
         readme = read(os.path.join(h.REPO, "README.md")).replace("\\", "/")
         for script in SCRIPTS:
