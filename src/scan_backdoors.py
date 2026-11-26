@@ -412,16 +412,104 @@ def snippet_at(text, nl, idx, m, at_end):
     return ("… " if a > 0 else "") + line[a:b].strip() + (" …" if b < len(line) else "")
 
 
+# ---------------------------------------------------------------------------
+# PHP comment mask. Signatures must not fire inside comments (WP core docblocks
+# quote $_POST in backticks all the time), but line numbers and snippets in the
+# report point into the ORIGINAL text - so the mask only blanks comment
+# characters: same length, newlines in the same places.
+# ---------------------------------------------------------------------------
+
+PHP_COMMENT_EDGE_RX = re.compile(r"<\?|>\?|//|/\*|['\"]|#")
+PHP_TAG_OPEN_RX = re.compile(r"<\?(?:php\b|=|[ \t])", re.I)
+
+
+def mask_php_comments(text):
+    """Blank //, # and /* ... */ comments inside PHP code regions with spaces.
+
+    String literals are left intact, and so is the HTML that may surround the
+    code in a .php file. The result has the same length as the input and every
+    newline in its original place, so offsets and line numbers computed on the
+    masked text stay valid for the original. Returns the input unchanged when
+    there is nothing to mask.
+    """
+    if "<" not in text or ("//" not in text and "/*" not in text and "#" not in text):
+        return text
+    out = None
+    n = len(text)
+
+    def blank(a, b, keep_newlines=False):
+        nonlocal out
+        if out is None:
+            out = list(text)
+        if keep_newlines:
+            for p in range(a, b):
+                if text[p] != "\n" and text[p] != "\r":
+                    out[p] = " "
+        else:
+            out[a:b] = [" "] * (b - a)
+
+    in_php = False
+    until = 0                      # everything before this index is processed
+    for m in PHP_COMMENT_EDGE_RX.finditer(text):
+        s = m.start()
+        if s < until:
+            continue               # inside a string/comment/tag already handled
+        tok = m.group(0)
+        if tok == "<?":
+            if in_php:
+                continue           # a stray tag inside active code: not a real tag
+            tag = PHP_TAG_OPEN_RX.match(text, s)
+            if tag:
+                in_php = True
+                until = tag.end()
+            continue
+        if not in_php:
+            continue               # a marker inside HTML: not a PHP comment
+        if tok == "?>":
+            in_php = False
+            until = s + 2
+        elif tok in ("'", '"'):
+            j = s + 1
+            while j < n:
+                ch = text[j]
+                if ch == "\\":
+                    j += 2
+                elif ch == tok or ch == "\n":
+                    j += 1
+                    break
+                else:
+                    j += 1
+            until = j              # string content is NOT masked
+        elif tok == "/*":
+            j = text.find("*/", s + 2)
+            j = n if j < 0 else j + 2
+            blank(s, j, keep_newlines=True)
+            until = j
+        else:                      # // or #
+            j = text.find("\n", s)
+            j = n if j < 0 else j
+            blank(s, j)
+            until = j
+    return "".join(out) if out is not None else text
+
+
 def scan_text(text, kinds, enabled):
     hits = []
     seen = set()
     nl = None
+    sigs_text = text
+    if kinds == ["php"]:
+        # Only files whose OWN kind is PHP: in .htaccess/.js/.text the PHP
+        # signatures run over embedded code, and the comments there belong to
+        # the other language (a BiaoJiOk marker in a .htaccess comment is a
+        # true positive and must keep firing on the raw text).
+        sigs_text = mask_php_comments(text)
     for kind in kinds:
         for sev, label, rx, w, at_end in SIGS_BY_KIND.get(kind, ()):
             if sev not in enabled:
                 continue
             n = 0
-            for m in rx.finditer(text):
+            for m in rx.finditer(sigs_text):
                 n += 1
                 if n > PATTERN_CAP:
                     break
