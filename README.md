@@ -63,7 +63,10 @@ Keep the console window open while you work: closing it stops the server. You ca
 python3 src/scan_backdoors_gui.py                 # start and open the browser
 python3 src/scan_backdoors_gui.py --no-browser    # start without opening the browser
 python3 src/scan_backdoors_gui.py --port 9000     # use another port
+python3 src/scan_backdoors_gui.py --self-test     # doctor: settings, scanner, save paths (no browser)
 ```
+
+A path field that does not check out (missing scanner, missing save folder, unreadable settings file) is reported in the boot log by field name; a scan or cleanup job is refused until it is fixed.
 
 ### Open it from a browser bookmark
 

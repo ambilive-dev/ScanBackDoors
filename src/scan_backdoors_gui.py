@@ -58,6 +58,64 @@ DEFAULTS = {
 }
 BOOL_KEYS = {k for k, v in DEFAULTS.items() if isinstance(v, bool)}
 
+# The GUI path fields and their kind: "file" must exist, "dir" must be a folder,
+# "save" is a report destination (its folder must exist and be writable).
+# The third element marks required fields (an empty required field is an error,
+# an empty optional one is fine).
+PATH_FIELDS = (
+    ("scanner_path", "file", True),    # required
+    ("site_dir", "dir", False),
+    ("baseline_dir", "dir", False),
+    ("whitelist_path", "file", False),
+    ("csv_path", "save", True),
+    ("xlsx_path", "save", False),
+    ("json_path", "save", False),
+)
+
+
+def load_config():
+    """Read CONFIG_PATH. -> (data dict or None, error message or None).
+    A missing file is not an error: the defaults are used."""
+    try:
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except OSError:
+        return None, None
+    except ValueError as exc:
+        return None, "the settings file is not valid JSON: %s" % exc
+    if not isinstance(data, dict):
+        return None, "the settings file is not a JSON object"
+    return data, None
+
+
+def validate_paths(settings):
+    """Check the configured path fields against their declared kind.
+    -> [(field, value, error)], empty when all is well. An empty optional field
+    is not an error; a relative path is resolved like the GUI resolves it
+    (against the scanner's folder)."""
+    bad = []
+    scanner_raw = str(settings.get("scanner_path") or "").strip()
+    base = Path(scanner_raw).expanduser().parent if scanner_raw else Path.cwd()
+    for key, kind, required in PATH_FIELDS:
+        raw = str(settings.get(key) or "").strip()
+        if not raw:
+            if key == "scanner_path":
+                bad.append((key, raw, "not set"))
+            continue
+        p = Path(raw).expanduser()
+        if not p.is_absolute():
+            p = base / p
+        if kind == "file" and not p.is_file():
+            bad.append((key, raw, "is not a file"))
+        elif kind == "dir" and not p.is_dir():
+            bad.append((key, raw, "is not a folder"))
+        elif kind == "save":
+            parent = p.parent
+            if not parent.exists():
+                bad.append((key, raw, "the folder does not exist: %s" % parent))
+            elif not os.access(str(parent), os.W_OK):
+                bad.append((key, raw, "the folder is not writable: %s" % parent))
+    return bad
+
 
 # ---------------------------------------------------------------------------
 # helper functions
@@ -152,9 +210,9 @@ class App(object):
         self.boot = str(int(time.time() * 1000))
         self.lock = threading.RLock()
         self.settings = dict(DEFAULTS)
+        self.log, self.log_first = [], 0          # before _load_config: boot errors must be loggable
         self._load_config()
         self.job = None
-        self.log, self.log_first = [], 0
         self.status = "Ready to run"
         self.idle_text = ""
         self.findings, self.next_id, self.findings_version, self.hidden_done = [], 1, 0, 0
@@ -169,13 +227,17 @@ class App(object):
         return self.settings.get(key, DEFAULTS.get(key))
 
     def _load_config(self):
-        try:
-            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return
-        self.update_settings(data, save=False)
-        if not Path(self.s("scanner_path")).is_file():
-            self.settings["scanner_path"] = DEFAULTS["scanner_path"]
+        """A settings problem is logged by field name; nothing is silently reset.
+        The server still starts - bad settings refuse jobs, not the GUI."""
+        data, err = load_config()
+        if err:
+            self.log_add("ERROR: %s (the defaults are used)" % err)
+            print("ERROR: %s (the defaults are used)" % err)
+        else:
+            self.update_settings(data, save=False)
+        for key, value, reason in validate_paths(self.settings):
+            self.log_add("ERROR: settings: %s = '%s' - %s" % (key, value, reason))
+            print("ERROR: settings: %s = '%s' - %s" % (key, value, reason))
 
     def update_settings(self, data, save=True):
         if not isinstance(data, dict):
@@ -636,6 +698,20 @@ class App(object):
                 cmd.append("--delete")
         return cmd
 
+    def _refuse_bad_settings(self):
+        """Check the path settings before a job starts. -> the problem list (empty
+        when the job may run). A refused job starts nothing and leaves self.job
+        untouched; the problems are named in the log and in a notice."""
+        problems = validate_paths(self.settings)
+        if not str(self.s("site_dir")).strip():
+            problems.append(("site_dir", "", "not set - choose a site folder on the Settings tab"))
+        if problems:
+            for key, value, reason in problems:
+                self.log_add("ERROR: %s = '%s' - %s" % (key, value, reason))
+            self.notify("error", "Job not started",
+                        "Fix the settings first: " + "; ".join("%s (%s)" % (k, r) for k, _v, r in problems))
+        return problems
+
     def _start_job(self, kind, cmd, markers=True):
         with self.lock:
             if self.job is not None:
@@ -651,6 +727,8 @@ class App(object):
         threading.Thread(target=self._run_job, args=(cmd,), daemon=True).start()
 
     def start_scan(self):
+        if self._refuse_bad_settings():
+            return
         cmd, markers = self.build_scan_command()
         with self.lock:
             if self.job is not None:
@@ -663,6 +741,8 @@ class App(object):
             self._start_job("scan", cmd, markers)
 
     def start_clean_plan(self):
+        if self._refuse_bad_settings():
+            return
         cmd = self.build_clean_command(False)
         with self.lock:
             self.cleaned, self.stripped, self.replaced, self.clean_summary = [], [], [], None
@@ -670,6 +750,8 @@ class App(object):
             self._start_job("clean-plan", cmd)
 
     def start_clean_apply(self):
+        if self._refuse_bad_settings():
+            return
         cmd = self.build_clean_command(True)
         with self.lock:
             self.cleaned, self.stripped, self.replaced, self.clean_summary = [], [], [], None
@@ -2013,13 +2095,84 @@ def ping(port):
         return False
 
 
+def _ver_tuple(v):
+    t = tuple(int(x) for x in str(v).split(".")[:3])
+    return t + (0,) * (3 - len(t))
+
+
+def self_test():
+    """Doctor: does the settings file parse, is the scanner there and new enough,
+    is the cleaner next to it, do the path settings check out? No server, no browser.
+    Exit 0 iff all checks pass."""
+    print("scan_backdoors_gui %s | self-test (doctor)" % VERSION)
+    settings = dict(DEFAULTS)
+    data, err = load_config()
+    if err:
+        print("  [FAIL] settings file: %s" % err)
+        ok = 0
+    else:
+        if data:
+            for k, v in data.items():
+                if k in DEFAULTS and k not in BOOL_KEYS and isinstance(v, (str, int, float)):
+                    settings[k] = str(v)
+                elif k in DEFAULTS and k in BOOL_KEYS:
+                    settings[k] = bool(v)
+            print("  [PASS] settings file: %d entries read" % len(data))
+        else:
+            print("  [PASS] settings file: not found, the defaults are used")
+        ok = 1
+    scanner = Path(str(settings.get("scanner_path") or "")).expanduser()
+    if scanner.is_file():
+        ok += 1
+        print("  [PASS] scanner_path: %s" % scanner)
+        try:
+            proc = subprocess.run([python_exe(), str(scanner), "--version"],
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            out = (proc.stdout or b"").decode("utf-8", "replace").strip()
+            ver = out.rsplit(" ", 1)[-1] if proc.returncode == 0 else ""
+            if proc.returncode == 0 and _ver_tuple(ver) >= _ver_tuple(MIN_SCANNER):
+                ok += 1
+                print("  [PASS] scanner version: %s (minimum %s)" % (ver, MIN_SCANNER))
+            else:
+                print("  [FAIL] scanner version: %r (minimum %s)" % (ver, MIN_SCANNER))
+        except Exception as exc:
+            print("  [FAIL] scanner version: could not run --version: %s" % exc)
+    else:
+        print("  [FAIL] scanner_path: '%s' is not a file" % settings.get("scanner_path"))
+    cleaner = scanner.parent / "clean_malware.py"
+    if cleaner.is_file():
+        ok += 1
+        print("  [PASS] clean_malware.py: next to the scanner")
+    else:
+        print("  [FAIL] clean_malware.py: not found next to the scanner (mass cleanup will not work)")
+    for key, _kind, _req in PATH_FIELDS:
+        raw = str(settings.get(key) or "").strip()
+        if not raw:
+            print("  [PASS] %s: not set%s" % (key, "" if key == "scanner_path" else " (optional)"))
+            ok += 1
+            continue
+        errs = [e for f, _v, e in validate_paths(settings) if f == key]
+        if errs:
+            print("  [FAIL] %s: '%s' %s" % (key, raw, errs[0]))
+        else:
+            print("  [PASS] %s: %s" % (key, raw))
+            ok += 1
+    total = 4 + len(PATH_FIELDS)
+    print("self-test: %d of %d checks passed" % (ok, total))
+    return 0 if ok == total else 1
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Browser front end for scan_backdoors.py, v" + VERSION)
     ap.add_argument("--port", type=int, default=DEFAULT_PORT,
                     help="port on 127.0.0.1 (default %d; keep it fixed to use a bookmark)" % DEFAULT_PORT)
     ap.add_argument("--no-browser", action="store_true", help="do not open the browser")
+    ap.add_argument("--self-test", action="store_true",
+                    help="check the settings file, the scanner and the save paths, then exit (no server, no browser)")
     ap.add_argument("--version", action="version", version=APP_ID + " " + VERSION)
     args = ap.parse_args(argv)
+    if args.self_test:
+        return self_test()
     if hasattr(sys.stdout, "reconfigure"):
         try:
             sys.stdout.reconfigure(errors="replace")
