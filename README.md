@@ -367,6 +367,49 @@ A re-run verifies the cached baseline offline (no network) and re-downloads only
 - **[CHANGELOG.md](CHANGELOG.md)** — what changed in each version.
 - **[SECURITY.md](SECURITY.md)** — what the tool guarantees, what it does not, and how to report a vulnerability.
 
+## How does it compare to other tools?
+
+The tools below solve adjacent problems; most pairs of them are meant to be used
+together, not as alternatives.
+
+| Tool | What it is | Where it looks |
+|---|---|---|
+| **Scan Backdoors** (this repo) | a standalone forensic file scanner for a web root | file contents, file names, folder layout, mtimes |
+| **wp2shell-scan** (InstaWP) | a bash script for the July-2026 WordPress campaign (CVE-2026-63030) | that campaign's filesystem patterns **and** the WordPress database |
+| **wp-guard** (cbuntingde) | a security plugin that runs *inside* a live WordPress | runtime protection of the site it is installed on |
+| **LMD** (rfxn/linux-malware-detect) | a host-level Linux malware detector | known-bad hashes, file entropy, host filesystem anomalies |
+
+- **vs wp2shell-scan.** The scanner now carries the filesystem side of that
+  campaign as ordinary signatures: a fake plugin folder named `<name>-<6 hex>`
+  in `wp-content/plugins/`, the `hash_equals(token, $_GET[…])` gate, the
+  command arriving through a local variable, and the impersonation author
+  header. So a campaign web shell is found on *any* site without a
+  campaign-specific script. What wp2shell-scan additionally covers — and a file
+  scanner cannot — is the *database* side: backdoor admin accounts and their
+  mail addresses in `wp_users`. After cleaning a compromised WordPress, check
+  the database separately.
+- **vs wp-guard.** It is a runtime shield for a *live* installation; it does not
+  audit a web root after the fact and does not understand Joomla at all. The
+  scanner is the post-incident complement: wp-guard may stop the attack, but it
+  does not tell you what the attacker already dropped.
+- **vs LMD.** LMD works at the *host* level (known-bad binary hashes, entropy,
+  SUID/hidden-file anomalies) and does not read PHP for webshell patterns, so a
+  fresh PHP shell with no known hash is not its finding. Use LMD for the host,
+  this scanner for the web root.
+- **vs signature lists (SecLists, FuzzDB, backdoor name lists).** The
+  signatures were cross-checked against published sample corpora: the
+  direct-sink classics (`system($_GET['cmd'])`, `file_put_contents(…,
+  $_POST[…])`) were already covered; this batch adds the *taint* form — request
+  data → variable → sink — which is how campaign shells dodge one-line greps.
+  For the ~300 PHP names in public backdoor lists only the unambiguous family
+  prefixes (`c99*`, `r57*`, `b374k*`) were added to the name check: bulk-adding
+  the rest would flag legitimate files like `client.php`.
+
+One deliberate asymmetry: the `hash_equals()`-against-request-data tell is
+switched **off** on a detected WordPress site, where it is the ordinary nonce
+check (`wp_verify_nonce`). On WordPress the campaign shell is still caught by
+the taint and name/location signatures, which run everywhere.
+
 ## Versioning
 
 One version for the whole bundle, written once in `src/version.py`; a release is

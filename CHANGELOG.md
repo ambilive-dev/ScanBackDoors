@@ -6,6 +6,43 @@ release is a tag with that number.
 
 ## Unreleased
 
+- Scanner: webshell detection no longer requires the request array to be written
+  into the sink directly. New signatures follow the value: a superglobal read
+  (optionally through `base64_decode`/`urldecode`/`rawurldecode`/`strrev`)
+  assigned to a local variable that later reaches `system`/`exec`/`shell_exec`/
+  `passthru`/`popen`/`proc_open`/`eval`/`assert`/`include`/`require` is
+  CRITICAL ("exec sink fed by a variable from request data"), and the same taint
+  into a file function (`fopen`/`opendir`/`readfile`/`file`/`file_get_contents`/
+  `copy`/`rename`/`unlink`/…) is OBFUSCATED. This is how the July-2026
+  wp2shell campaign web shell (`$cmd = $_GET['c']; system($cmd);`) evades
+  one-line greps.
+- Scanner: a file path taken from the request is now flagged whether the file is
+  opened or written: `copy(…, $_POST['remotefile'])` and its siblings
+  (`rename`/`move_uploaded_file`/`link`/`symlink`/`touch`/`unlink`/`chmod`/
+  `mkdir`/`rmdir`) are CRITICAL, and `opendir`/`fopen`/`readfile`/
+  `file_get_contents`/`file` straight from `$_GET`/`$_POST` are CRITICAL - the
+  classic uploader and LFI shells.
+- Scanner: the July-2026 campaign tells. A plugin folder named
+  `<name>-<6 hex digits>` under `wp-content/plugins/` or `mu-plugins/`
+  (real plugin slugs end in a version, never in a bare hex id) is OBFUSCATED,
+  as is a plugin header claiming `Author: WordPress.org Community`
+  (impersonation). `hash_equals()` against request data is OBFUSCATED on
+  non-WordPress sites (the classic `?t=<hash>` webshell gate) and switched off
+  on detected WordPress, where it is the ordinary nonce verification - on
+  WordPress the campaign shell is still caught by the taint, name and folder
+  signatures.
+- Scanner: the webshell-name check now knows the classic shell families with
+  version suffixes: a stem that *starts* with `c99`, `r57` or `b374k`
+  (`c99_madnet.php`, `r57shell.php`) is a typical webshell filename, not only
+  the bare family name. Cross-checked against a published 772-name backdoor
+  list: only the unambiguous prefixes were added, because bulk-adding the rest
+  would flag legitimate files (`client.php`, `config.inc.php`).
+- Tests: four new sealed payloads pin the new signatures - the campaign web
+  shell (taint + folder + header), a taint LFI in `/tmp/`, an uploader with a
+  request-driven destination, and a prefixed shell name.
+- README: a "How does it compare to other tools?" section (wp2shell-scan,
+  wp-guard, LMD, public signature lists), including what a file scanner
+  deliberately does not cover (the database side, runtime protection).
 - `--self-test` on all three scripts: a built-in liveness check, no network and no
   real site needed. The scanner unseals four embedded test payloads into a throwaway
   folder under `%TEMP%/sbd-fixtures` and each must be detected; the cleaner does the
