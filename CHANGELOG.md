@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The bundle has one
 version for all three components; it is written once in `src/version.py` and a
 release is a tag with that number.
 
+## Unreleased
+
+- Hardening (cleaner): the hash check of a freshly written file - the quarantine
+  copy after `--apply`, the replaced file after `--replace-core` - now retries
+  briefly when the read is locked. Real-time antivirus keeps a short lock on
+  freshly written files while it scans them, and a collision used to fail the
+  file with a raw `PermissionError` in the middle of `--apply`. With no lock the
+  behavior is unchanged; when a lock outlives the retry the cleaner gives up with
+  a message that names the cause instead of a traceback.
+
 ## v3.1 — 2026-11-26
 
 - One version for the bundle: `src/version.py` is the only place the number is
