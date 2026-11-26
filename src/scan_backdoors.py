@@ -623,6 +623,47 @@ def manifest_author_hits(rel, text, base_dirs):
     return [(O, 1, "plugin manifest claims Joomla! Project authorship, but the whole plugin folder is absent from the clean Joomla distribution", rel, 12)]
 
 
+def _jconfig_class_end(text, m):
+    """Index just past the closing brace of the JConfig class body.
+
+    The "code after class JConfig" signature needs the real end of the class:
+    a backdoor appended below the class carries braces of its own and
+    str.rfind("}") would land inside it. Braces inside string literals and
+    comments do not count. Returns -1 if the body never closes.
+    """
+    i = text.find("{", m.end())
+    if i < 0:
+        return -1
+    n = len(text)
+    depth = 0
+    quote = ""
+    while i < n:
+        c = text[i]
+        if quote:
+            if c == quote:
+                quote = ""
+            elif c == "\\" and i + 1 < n:
+                i += 1
+        elif c in "'\"":
+            quote = c
+        elif c == "#" or (c == "/" and i + 1 < n and text[i + 1] == "/"):
+            if c == "/":
+                i += 1                      # skip the second "/" of "//"
+            nl = text.find("\n", i)
+            i = n if nl < 0 else nl
+        elif c == "/" and i + 1 < n and text[i + 1] == "*":
+            close = text.find("*/", i + 2)
+            i = n if close < 0 else close + 1
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return -1
+
+
 def config_hits(text):
     hits = []
     if text.count("<?php") > 1:
@@ -634,7 +675,10 @@ def config_hits(text):
     head = re.sub(r"<\?php|/\*.*?\*/|//[^\n]*|#[^\n]*", "", text[:m.start()], flags=re.S).strip()
     if head:
         hits.append((O, 0, "code before class JConfig", trim(head), 8))
-    tail = text[text.rfind("}") + 1:].strip()
+    end = _jconfig_class_end(text, m)
+    if end < 0:
+        end = text.rfind("}") + 1           # malformed: the body never closes, fall back to the last brace
+    tail = text[end:].strip()
     if tail.endswith("?>"):
         tail = tail[:-2].strip()
     if tail:

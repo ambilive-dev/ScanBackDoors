@@ -15,12 +15,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        # 3.8 is not in the toolchains of the newest Ubuntu image; 24.04 is the
+        # last one that ships it
+        os: [ubuntu-24.04, windows-latest]
         python: ["3.8", "3.11", "3.13"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
 

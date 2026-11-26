@@ -23,6 +23,19 @@ release is a tag with that number.
   Malicious samples live in `tests/payloads/*.b64` and are unsealed only into a
   temporary fixture folder.
 - `.github/workflows/ci.yml`: the suite on Linux and Windows on Python 3.8/3.11/3.13.
+- Bug fix (scanner): the "code after class JConfig" signature looked for the end
+  of the class at the LAST `}` of the file. An appended backdoor carries braces
+  of its own, so the signature could never fire on exactly the injections it was
+  written for. The class end is now found by counting braces from the class
+  opening brace (braces inside string literals and comments are ignored).
+- Bug fix (cleaner): the "the quarantine must not be inside the site" check
+  compared a resolved path against an absolute one. On machines where the two
+  spellings differ (8.3 short names, junctions, reparse points) the check was
+  silently disabled and a quarantine could end up in the web root. Both sides
+  are now normalized the same way, and when the containment cannot be
+  established the cleaner refuses instead of running (fail closed).
+- CI: the Linux leg is pinned to `ubuntu-24.04` (newer images no longer ship
+  Python 3.8), `actions/checkout` and `actions/setup-python` are on v7.
 
 ## v3.0 — 2026-10-19
 
