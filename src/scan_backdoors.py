@@ -113,14 +113,14 @@ HTACCESS_NAME_RE = re.compile(r"^(?:\.htaccess(?:[._~-].*)?|htaccess(?:\.(?:txt|
 IMG_DOUBLE_RE = re.compile(r"\.(?:jpe?g|png|gif|ico|bmp|webp)\.(?:php\d?|phtml|pht|phar)$")
 
 # names found in the allow-list of the malicious .htaccess (most likely the dropped shells)
-MALWARE_NAMES = {"moderation.php", "system_log.php", "inputs.php", "chtmlfuns.php", "cjfuns.php", "classsmtps.php",
+MALWARE_NAMES = {"chtmlfuns.php", "cjfuns.php", "classsmtps.php",
                  "classfuns.php", "comfunctions.php", "comdofuns.php", "connects.php", "copypaths.php", "delpaths.php",
                  "doiconvs.php", "epinyins.php", "filefuns.php", "gdftps.php", "hinfofuns.php", "hplfuns.php",
                  "memberfuns.php", "moddofuns.php", "onclickfuns.php", "phpzipincs.php", "qfunctions.php",
                  "qinfofuns.php", "schallfuns.php", "tempfuns.php", "txets.php", "thoms.php"}
 SHELL_NAMES = {"shell", "c99", "c100", "r57", "r58", "wso", "wsoshell", "b374k", "alfa", "cmd",
                "bypass", "hack", "hacked", "backdoor", "webshell", "filesman", "indoxploit",
-               "priv8", "sh3ll", "symlink", "leafmailer", "filemanager", "tinyfilemanager", "fm"}
+               "priv8", "sh3ll", "symlink", "leafmailer", "tinyfilemanager", "fm"}
 
 # Where PHP must not exist
 STRICT_DIRS = {"images", "tmp"}
@@ -195,8 +195,8 @@ S(C, "Tiny File Manager / webshell", r"tinyfilemanager|embedded_pass_hash|fm_cle
 S(C, "malware tag <script id='sggtp'>", r"<script[^>]*\bid\s*=\s*['\"]?sggtp", "php js html text", 30, re.I)
 # ---- CRITICAL: JS / HTML ----
 S(C, "crypto-miner", r"coinhive|coin-hive|cryptonight|cryptoloot|crypto-loot|webminepool|minero\.cc|authedmine", "php js html", 25, re.I)
-S(C, "hidden iframe that loads a payload (src=/srcdoc=)", r"<iframe\b(?=[^>]{0,400}\b(?:src|srcdoc)\s*=)[^>]{0,400}(?:\b(?:width|height)\s*=\s*['\"]?[01](?:px)?['\"]?[\s>/]|display\s*:\s*none|visibility\s*:\s*hidden)", "php js html", 15, re.I)
-S(W, "iframe built in JS (createElement / .src=)", r"createElement\s*\(\s*['\"]iframe\b|\biframe\b[^;\n]{0,40}\.src\s*=|innerHTML[^;\n]{0,120}<iframe", "php js html", 1)
+S(C, "hidden iframe that loads a payload (src=/srcdoc=)", r"<iframe\b(?=[^>]{0,400}\b(?:src|srcdoc)\s*=\s*['\"]?\s*(?:https?://|//|/|\?|data:|<\?|\$[A-Za-z_]|\&#|[^'\">\s]{1,80}\.(?:php|phtml)))[^>]{0,400}(?:\b(?:width|height)\s*=\s*['\"]?[01](?:px)?['\"]?[\s>/]|display\s*:\s*none|visibility\s*:\s*hidden)", "php js html", 15, re.I)
+S(W, "iframe built in JS (createElement / .src=)", r"createElement\s*\(\s*['\"]iframe\b|\biframe\b[^;\n]{0,40}\.src\s*=(?!=)\s*['\"]?\s*(?!javascript:|about:blank)|innerHTML[^;\n]{0,120}<iframe", "php js html", 1)
 S(C, "hex-obfuscated JS _0xXXXX", r"_0x[0-9a-fA-F]{4,}", "php js html")
 S(C, "JS packer eval(function(p,a,c,k,e,d))", r"\beval\s*\(\s*function\s*\(\s*p\s*,\s*a\s*,\s*c\s*,\s*k\s*,\s*e\s*,\s*[dr]\s*\)", "php js html", 15)
 S(C, "document.write/eval of decoded string", r"\b(?:document\.write|eval)\s*\(\s*(?:unescape|atob|decodeURIComponent|String\.fromCharCode)\s*\(", "php js html", 20)
@@ -233,7 +233,7 @@ S(O, "many blank lines before code (hidden code)", r"(?:[ \t]*\r?\n){30,}[ \t]*\
 HARVEST_C12_LABEL = "credential harvesting: password field read from $_POST"
 S(C, HARVEST_C12_LABEL, r"\$_POST\b[^\n]{0,80}?\[\s*['\"](?:password|passwd|pass|pwd|userpassword|regpass)['\"]\](?!\s*=[^=])", "php", 12)
 # ---- OBFUSCATED: data store hidden in an image (steganography) ----
-S(O, "custom X- response header (self-advertising marker)", r"\bheader\s*\(\s*@?\s*['\"]X-[\w\-]{2,40}[:\"]", "php", 8)
+S(O, "custom X- response header (self-advertising marker)", r"\bheader\s*\(\s*@?\s*['\"]X-(?!Accel-Redirect|Blueprint-Import-Session|Content-Type-Options|Frame-Options|Lighttpd-Sendfile|MCP-API-Key|Redirect-By|Robots|Sendfile|UA-Compatible|WP-)[\w\-]{2,40}[:\"]", "php", 8)
 S(O, "GIF magic bytes handled in PHP (image used as a data container)", r"GIF8[79]a", "php", 3)
 S(O, "hard-coded blank GIF (R0lGODlh...) as a data container", r"R0lGODlh", "php", 5)
 # ---- WARNING: weak signatures; only their correlation (harvester_hits) makes a finding CRITICAL ----
@@ -312,7 +312,8 @@ def looks_random(stem):
 def name_checks(name, low):
     notes = []
     if low.startswith("."):
-        notes.append((C, 0, "hidden PHP file (leading dot)", name, 15))
+        if low != ".phpstorm.meta.php":
+            notes.append((C, 0, "hidden PHP file (leading dot)", name, 15))
         stem = ""
     else:
         stem = low.split(".")[0]
@@ -682,9 +683,19 @@ def mtime_backdate_hits(text):
     if not m:
         return []
     line = text.count("\n", 0, m.start()) + 1
-    if BACKDATE_RX.search(text):
+    # only a backdating expression INSIDE the touch(...) call counts: a stray 86400 / time()- /
+    # rand() elsewhere in a big file (an mtime restore, a method definition) is not backdating
+    i, depth, n = m.end(), 1, len(text)
+    while i < n and depth:
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+        i += 1
+    args = text[m.end():i - 1]
+    if BACKDATE_RX.search(args):
         return [(C, line, "mtime backdating (sets a fake old date): defeats --since and 'recently modified' checks", "", 15)]
-    if MTIME_RX.search(text):
+    if MTIME_RX.search(args):
         return [(O, line, "touch() + file_mtime: restores the original file date (check why)", trim(m.group(0)), 6)]
     return [(O, line, "touch() changes a file date", trim(m.group(0)), 3)]
 
@@ -740,6 +751,8 @@ def gif_trailing_hits(raw):
 def blob_hits(rel, name, kind, raw):
     """Extensionless file whose content is a printable high-entropy blob (encoded payload / data drop)."""
     if kind is not None or len(raw) < 128:
+        return []
+    if name.lower().endswith((".pem", ".crt", ".cer", ".asc", ".base64")):
         return []
     if sum(1 for b in raw if 32 <= b < 127) < 0.9 * len(raw):
         return []
@@ -841,6 +854,8 @@ def location_hits(rel, name, size, head):
         return [(C, 0, "PHP file in /%s/ (must not exist there)" % first, rel, 25)]
     soft = first in SOFT_DIRS or (first == "administrator" and len(parts) > 1 and parts[1] in SOFT_DIRS)
     if soft:
+        if name.lower().startswith("autoload") and name.lower().endswith(".php"):
+            return []
         if DIE_HEADER_RE.match(head):
             return []
         return [(C, 0, "PHP file in /%s/ without Joomla die() header" % parts[-1 if first == "administrator" else 0], rel, 15)]
@@ -1018,7 +1033,8 @@ def scan_file(path):
                 elif kind in ("html", "htaccess"):
                     hits.append((C, line_no, "PHP code inside a non-PHP file (%s)" % kind, name, 15))
                 else:
-                    hits.append((O, line_no, "PHP tag inside a %s file" % kind, name, 6))
+                    if not (name.lower().endswith(".phpt") or raw[:2] == b"#!"):
+                        hits.append((O, line_no, "PHP tag inside a %s file" % kind, name, 6))
         else:
             if raw[:4] in (b"GIF8",) or raw[:3] == b"\xff\xd8\xff" or raw[:4] == b"\x89PNG":
                 hits.append((C, 1, "image magic bytes at the start of a PHP file", name, 25))
