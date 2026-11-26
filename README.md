@@ -329,6 +329,29 @@ Safeguards: the site and baseline versions must match (otherwise it refuses); if
 
 ---
 
+## Getting a clean Joomla baseline (`joomla_baseline.py`)
+
+```
+python3 joomla_baseline.py 3.9.27
+```
+
+downloads the official Joomla 3.9.27 Full_Package from the `joomla/joomla-cms` GitHub releases, verifies it (the API sha256 digest when the API provides one, otherwise the version of the unpacked distribution must match the request), unpacks it, and writes a hash manifest:
+
+```
+joomla-baselines/Joomla_3.9.27/                <- pass this folder as --baseline-dir
+joomla-baselines/Joomla_3.9.27.baseline.json   <- manifest: every file and its sha256
+```
+
+| flag | meaning |
+|---|---|
+| `--out DIR` | cache directory (default: `joomla-baselines` in the current directory) |
+| `--force` | re-download even when the cached baseline is valid |
+| `--keep-archive` | keep the downloaded zip |
+
+A re-run verifies the cached baseline offline (no network) and re-downloads only if a file changed. The resulting folder is accepted by both `scan_backdoors.py --baseline-dir` and `clean_malware.py --replace-core --baseline-dir`. The tool talks to `api.github.com` and GitHub's download CDN over HTTPS only.
+
+---
+
 ## Documentation
 
 - **[docs/README_RU.md](docs/README_RU.md)** — Russian command-line reference.

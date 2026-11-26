@@ -23,9 +23,10 @@ SCRIPTS = {
     "scan_backdoors.py": "scan_backdoors",
     "scan_backdoors_gui.py": "scan_backdoors_gui",
     "clean_malware.py": "clean_malware",
+    "joomla_baseline.py": "joomla_baseline",
 }
 ROOT_FILES = ["README.md", "LICENSE", "CHANGELOG.md", "SECURITY.md", "start.bat", ".gitignore"]
-INTERNAL_FLAGS = {"progress-lines"}          # GUI plumbing, not documented as a user option
+INTERNAL_FLAGS = {"progress-lines", "release-url"}   # plumbing, not documented as a user option
 
 
 def read(path):
@@ -84,7 +85,7 @@ class VersionTest(unittest.TestCase):
         """The CLI scanner is uploaded to servers as one file: the fallback must work."""
         keep = h.workdir("sbd-single-")
         try:
-            for script in ("scan_backdoors.py", "clean_malware.py"):
+            for script in ("scan_backdoors.py", "clean_malware.py", "joomla_baseline.py"):
                 shutil.copy2(os.path.join(h.SRC, script), keep)
                 proc = subprocess.Popen([sys.executable, "-u", os.path.join(keep, script), "--version"],
                                         cwd=keep, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -188,7 +189,9 @@ class PublishedTreeTest(unittest.TestCase):
         """Reports, quarantines and the GUI's whitelist must never be committable."""
         checks = ["report-data.csv", "cleanup-report.csv", "src/whitelist.txt",
                   "site/_quarantine_site/2026/x.php", "configuration.php.modified",
-                  "__pycache__/scan_backdoors.pyc", ".scan_backdoors_gui.json"]
+                  "__pycache__/scan_backdoors.pyc", ".scan_backdoors_gui.json",
+                  "joomla-baselines/Joomla_3.9.27/index.php",
+                  "joomla-baselines/Joomla_3.9.27.baseline.json"]
         for rel in checks:
             proc = subprocess.Popen(["git", "-C", h.REPO, "check-ignore", "--no-index", "-q", rel],
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)

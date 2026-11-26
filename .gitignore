@@ -15,6 +15,10 @@ cleanup-report.csv
 # whitelist the GUI writes by default (next to scan_backdoors.py)
 src/whitelist.txt
 
+# the local Joomla baseline cache written by joomla_baseline.py
+joomla-baselines/
+*.baseline.json
+
 # quarantine created next to a scanned site, and the copies it keeps
 _quarantine_*/
 *.modified
