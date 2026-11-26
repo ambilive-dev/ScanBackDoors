@@ -523,6 +523,40 @@ PLANTED = {
         "meta": [],
         "verdict": "MEDIUM",
     },
+    # wp2shell campaign drop (July 2026): fake plugin <name>-<6hex>, impersonation
+    # author header, hash_equals token gate, command through a local variable.
+    "wp-content/plugins/wpeditor-1a2b3c/wpeditor-1a2b3c.php": {
+        "payload": "wp2shell-campaign.php",
+        "signatures": [
+            "exec sink fed by a variable from request data",
+            "hash_equals() comparing against request data (token-gated backdoor)",
+            "plugin folder named like a campaign drop (<name>-<6 hex> suffix)",
+            "plugin header claims 'WordPress.org Community' authorship (impersonation)",
+        ],
+        "meta": ["plugin folder named like a campaign drop (<name>-<6 hex> suffix)"],
+        "verdict": "HIGH",
+    },
+    # request data into a local variable, then a directory/file read (LFI shell)
+    "tmp/fetch_lfi.php": {
+        "payload": "lfi-variable.php",
+        "signatures": ["PHP file in /tmp/", "file function fed by a variable from request data"],
+        "meta": ["PHP file in /tmp/"],
+        "verdict": "HIGH",
+    },
+    # destination path straight from the request (uploader / arbitrary write)
+    "connector-up.php": {
+        "payload": "upload-dest.php",
+        "signatures": ["file write/copy to a path from request data"],
+        "meta": [],
+        "verdict": "HIGH",
+    },
+    # classic shell family with a version suffix (c99_madnet.php, r57shell.php, ...)
+    "c99_madnet.php": {
+        "payload": "c99_madnet.php",
+        "signatures": ["typical webshell filename"],
+        "meta": ["typical webshell filename"],
+        "verdict": "HIGH",
+    },
 }
 
 # clean_malware.py implements fewer families than the scanner detects; these are
