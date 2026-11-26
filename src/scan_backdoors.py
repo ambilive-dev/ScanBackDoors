@@ -158,6 +158,11 @@ def S(sev, label, pattern, kinds, weight=None, flags=0, at_end=False):
 C, O, W = SEV_CRIT, SEV_OBF, SEV_WARN
 RQ = r"\$_(?:POST|GET|REQUEST|COOKIE)"
 
+# WordPress core folders: file management and a diff engine literally named
+# shell.php ship there, so the FM/webshell-name heuristics are gated off for them
+# on detected WordPress sites.
+WP_CORE_PREFIXES = ("wp-includes/", "wp-admin/")
+
 # ---- CRITICAL: PHP ----
 S(C, "eval(request data)", r"\beval\s*\(\s*@?\s*(?:base64_decode\s*\(\s*)?" + RQ, "php", 25)
 S(C, "eval(decode chain)", r"\beval\s*\(\s*@?\s*(?:base64_decode|gzinflate|gzuncompress|gzdecode|str_rot13|hex2bin|convert_uudecode|rawurldecode|urldecode|strrev)\s*\(", "php", 25)
@@ -222,8 +227,10 @@ S(O, "cloaking by User-Agent/Referer", r"HTTP_(?:USER_AGENT|REFERER).{0,200}(?:g
 S(O, "many blank lines before code (hidden code)", r"(?:[ \t]*\r?\n){30,}[ \t]*\S", "php htaccess", 5, at_end=True)
 
 # ---- CRITICAL: credential harvester (Joomla-specific) ----
-# Legitimate Joomla code does NOT read $_POST['password'] directly (login goes through the API), so this is a strong indicator
-S(C, "credential harvesting: password field read from $_POST", r"\$_POST\b[^\n]{0,80}?\[\s*['\"](?:password|passwd|pass|pwd|userpassword|regpass)['\"]", "php", 12)
+# Legitimate Joomla code does NOT read $_POST['password'] directly (login goes through the API), so this is a strong indicator.
+# On WordPress the same reads are legitimate core/plugin code, so the heuristic is gated off on detected WP sites.
+HARVEST_C12_LABEL = "credential harvesting: password field read from $_POST"
+S(C, HARVEST_C12_LABEL, r"\$_POST\b[^\n]{0,80}?\[\s*['\"](?:password|passwd|pass|pwd|userpassword|regpass)['\"]", "php", 12)
 # ---- OBFUSCATED: data store hidden in an image (steganography) ----
 S(O, "custom X- response header (self-advertising marker)", r"\bheader\s*\(\s*@?\s*['\"]X-[\w\-]{2,40}[:\"]", "php", 8)
 S(O, "GIF magic bytes handled in PHP (image used as a data container)", r"GIF8[79]a", "php", 3)
@@ -508,6 +515,8 @@ def scan_text(text, kinds, enabled):
         for sev, label, rx, w, at_end in SIGS_BY_KIND.get(kind, ()):
             if sev not in enabled:
                 continue
+            if label == HARVEST_C12_LABEL and CFG.get("cms") == "wp":
+                continue
             n = 0
             for m in rx.finditer(sigs_text):
                 n += 1
@@ -596,8 +605,14 @@ def base64_literal_hits(text, folder):
     return hits
 
 
-def php_anomalies(raw, text, folder=None):
-    hits = filemanager_hits(text) + base64_literal_hits(text, folder)
+def php_anomalies(raw, text, folder=None, rel=""):
+    if rel.startswith(WP_CORE_PREFIXES) and CFG.get("cms") == "wp":
+        # WP core ships its own file management (wp-admin/includes/file.php):
+        # the "web file manager" heuristic would flag legitimate core code.
+        fm_hits = []
+    else:
+        fm_hits = filemanager_hits(text)
+    hits = fm_hits + base64_literal_hits(text, folder)
     if b"\x00" in raw:
         hits.append((O, 0, "NUL bytes inside PHP file", "", 5))
     ml, ml_i, ml_s = 0, 0, ""
@@ -644,7 +659,10 @@ DEFERRED_RX = re.compile(r"\bregister_shutdown_function\s*\(")
 
 
 def harvester_hits(text):
-    """Reads a password field from $_POST and stores it somewhere = credential harvester."""
+    """Reads a password field from $_POST and stores it somewhere = credential harvester.
+    Joomla-specific pattern: on WordPress these reads are legitimate core/plugin code."""
+    if CFG.get("cms") == "wp":
+        return []
     m = HARVEST_POST_RX.search(text)
     if not m:
         return []
@@ -920,6 +938,11 @@ def scan_file(path):
     rel = os.path.relpath(path, cfg["start"]).replace(os.sep, "/")
     name = os.path.basename(path)
     kind, hits = classify(name)
+    if cfg["cms"] == "wp":
+        # Joomla-specific name heuristics do not apply to a WordPress site.
+        hits = [h for h in hits
+                if h[2] != "WordPress-style filename (wp-*.php) in Joomla"
+                and not (h[2] == "typical webshell filename" and rel.startswith(WP_CORE_PREFIXES))]
     if os.path.splitext(name.lower())[1] in cfg["exclude_ext"]:
         return None, "skip"
     try:
@@ -999,7 +1022,7 @@ def scan_file(path):
             if raw[:4] in (b"GIF8",) or raw[:3] == b"\xff\xd8\xff" or raw[:4] == b"\x89PNG":
                 hits.append((C, 1, "image magic bytes at the start of a PHP file", name, 25))
             hits += location_hits(rel, name, st.st_size, text[:300])
-            hits += php_anomalies(raw, text, os.path.dirname(path))
+            hits += php_anomalies(raw, text, os.path.dirname(path), rel)
             if name.lower() == "configuration.php" and "/" not in rel:
                 hits += config_hits(text)
             if cfg["posix"] and (stat.S_IMODE(st.st_mode) & 0o002):
@@ -1254,6 +1277,21 @@ def baseline_dir_set(clean_dir):
     return s
 
 
+def detect_cms(start):
+    """Best-effort CMS detection from the well-known files in the site root.
+    Some heuristics (Joomla credential harvester, wp-* names, WP core folders)
+    only make sense for one CMS, so they are gated on the detected CMS."""
+    try:
+        entries = {e.lower() for e in os.listdir(start)}
+    except OSError:
+        return None
+    if "wp-config.php" in entries or "wp-load.php" in entries or "wp-settings.php" in entries:
+        return "wp"
+    if "configuration.php" in entries or "administrator" in entries:
+        return "joomla"
+    return None
+
+
 def iter_paths(start, excl_dirs):
     for root, dirs, files in os.walk(start):
         if excl_dirs:
@@ -1294,7 +1332,7 @@ def self_test():
             "since": None, "enabled": {SEV_CRIT, SEV_OBF, SEV_WARN},
             "wl_hashes": set(), "wl_paths": [], "baseline": None,
             "baseline_dirs": set(), "skip_paths": set(), "baseline_pkgs": set(),
-            "posix": os.name != "nt", "exclude_ext": set(),
+            "posix": os.name != "nt", "exclude_ext": set(), "cms": None,
         })
         for rel, b64, expected in SELFTEST:
             path = os.path.join(work, *rel.split("/"))
@@ -1406,6 +1444,7 @@ def main(argv=None):
     skip_paths = set(os.path.abspath(p) for p in out_files)
     skip_paths.add(os.path.abspath(__file__))     # the script itself contains all the signatures
 
+    cms = detect_cms(start)
     cfg = {
         "start": start, "max_size": int(args.max_size * 1024 * 1024), "max_matches": args.max_matches,
         "since": since, "enabled": enabled, "wl_hashes": wl_hashes, "wl_paths": wl_paths,
@@ -1413,10 +1452,14 @@ def main(argv=None):
         "baseline_pkgs": set("/".join(r.split("/")[:4]) for r in (baseline or {}) if r.startswith("libraries/vendor/")), "posix": os.name != "nt",
         "exclude_ext": set(e.strip().lower() if e.strip().startswith(".") else "." + e.strip().lower()
                            for e in args.exclude_ext.split(",") if e.strip()),
+        "cms": cms,
     }
     excl_dirs = set(d.strip() for d in args.exclude_dir.split(",") if d.strip())
 
     print("scan_backdoors %s | scanning '%s' ..." % (VERSION, start))
+    if cms:
+        print("site CMS: %s (root-file heuristic: gates the CMS-specific heuristics)"
+              % ("WordPress" if cms == "wp" else "Joomla"))
     t0 = time.time()
     emit("PHASE", "walk")
     paths = list(iter_paths(start, excl_dirs))
