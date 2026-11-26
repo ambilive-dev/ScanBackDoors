@@ -314,6 +314,7 @@ python3 clean_malware.py /path/to/site --apply --delete # delete permanently
 | `--force-version` | off | Skip the version and percentage checks (**dangerous**). |
 | `--no-media` | off | Do not check images/video for PHP code inside (faster on large sites). By default `.jpg .png .gif .ico .flv .mp3 .mp4` and others are checked. |
 | `--progress-lines` | | Service lines `@@...` for the GUI. |
+| `--self-test` | | Run the built-in liveness check: one sample per family (htaccess / backdoor / filemanager) is unsealed into a throwaway folder under `%TEMP%/sbd-fixtures` and must be recognized. Exit 0 if all are recognized. |
 
 **How it stays safe:** quarantine with hash verification before deletion; files with 0444 permissions and 0555 directories are handled (directory permissions are restored); symbolic links are skipped; a repeated run finds nothing.
 

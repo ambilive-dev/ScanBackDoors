@@ -14,3 +14,11 @@ class ScannerSelfTest(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.out)
         self.assertIn("self-test: 4 of 4 checks passed", res.out)
         self.assertNotIn("[FAIL]", res.out)
+
+
+class CleanerSelfTest(unittest.TestCase):
+    def test_selftest_passes(self):
+        res = h.run("clean_malware.py", ["--self-test"], timeout=180)
+        self.assertEqual(res.returncode, 0, res.out)
+        self.assertIn("self-test: 3 of 3 checks passed", res.out)
+        self.assertNotIn("[FAIL]", res.out)
