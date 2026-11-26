@@ -13,6 +13,17 @@ release is a tag with that number.
   file with a raw `PermissionError` in the middle of `--apply`. With no lock the
   behavior is unchanged; when a lock outlives the retry the cleaner gives up with
   a message that names the cause instead of a traceback.
+- New tool (`joomla_baseline.py`): given a version, downloads the official
+  Joomla Full_Package from the `joomla/joomla-cms` GitHub releases, verifies it
+  (the API sha256 digest when the API provides one, otherwise the version of the
+  unpacked distribution must match the request), unpacks it into a local cache
+  and writes a sha256 manifest for every file. The result is passed as
+  `--baseline-dir` to the scanner or the cleaner; a re-run verifies the cached
+  baseline offline and re-downloads only if a file changed.
+- Bug fix (cleaner): the Joomla version is now detected for 3.7 and earlier in
+  the `--replace-core` baseline check (the real files use `const RELEASE` /
+  `const DEV_LEVEL`, which the old pattern could not match); such versions were
+  reported as "undetermined" and the replacement was refused.
 
 ## v3.1 — 2026-11-26
 
