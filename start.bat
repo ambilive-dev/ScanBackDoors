@@ -15,7 +15,7 @@ echo Scan Backdoors: starting the local server. The GUI opens in your browser.
 echo Bookmark http://127.0.0.1:8765/ to come back to it.
 echo Keep this window open while you work. Close it, or use "Quit server" in the page, to stop.
 echo.
-%PY% scan_backdoors_gui.py
+%PY% src\scan_backdoors_gui.py
 if errorlevel 1 goto :failed
 exit /b 0
 
@@ -29,6 +29,6 @@ exit /b 1
 echo.
 echo The server exited with an error. See the message above.
 echo If Windows opened the Microsoft Store, install Python from python.org instead.
-echo To use another port run:  py -3 scan_backdoors_gui.py --port 9000
+echo To use another port run:  py -3 src\scan_backdoors_gui.py --port 9000
 pause
 exit /b 1

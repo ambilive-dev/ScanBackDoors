@@ -1,26 +1,54 @@
-<p align="center"><img src="emblem_ScanBackDoors_512.png" alt="Scan Backdoors" width="200"></p>
+<p align="center"><img src="assets/emblem_ScanBackDoors_512.png" alt="Scan Backdoors" width="200"></p>
 
-# scan_backdoors 2.1: parameter reference
+# Scan Backdoors
 
 A scanner for backdoors, web shells and malicious code on Joomla/PHP sites, with a mass-cleanup tool and a browser-based GUI.
-Only Python 3.6+ is required, nothing needs to be installed (no Tk, no pip).
+Only Python 3.6+ is required, nothing needs to be installed (no Tk, no pip). No data ever leaves your machine: the tool only reads the folder you point it at and writes reports you ask for.
+
+| Component | Version | What it is |
+|---|---|---|
+| `src/scan_backdoors.py` | 2.1 | The scanner: signatures, baseline diff against a clean Joomla, multi-processing, CSV/JSON/XLSX reports |
+| `src/scan_backdoors_gui.py` | 3.0 | Browser-based GUI: a local web server on 127.0.0.1 plus one page (scan, findings, quarantine, mass cleanup) |
+| `src/clean_malware.py` | 1.0 | Mass cleanup of known malware families, with quarantine and core-file restore from a clean distribution |
+
+Released versions are tagged (see [CHANGELOG.md](CHANGELOG.md)). The scanner and the GUI are versioned separately: the GUI needs scanner 2.1 or newer and prints a warning if it is older.
+
+## Repository layout
+
+```
+start.bat                     Windows launcher (double-click)
+src/                          the three scripts; they must stay in one folder
+assets/                       logo PNG and the .ico for a desktop shortcut
+data/                         known-clean hash allowlist (see below)
+docs/                         Russian manual (docs/README_RU.md)
+```
+
+## Known-clean allowlist
+
+`data/whitelist-known-clean.txt` is a curated list of SHA-256 hashes of legitimate third-party files that the signatures otherwise flag (TCPDF, Akeeba `phpfinder`, VirtueMart `vrequest.php`, RSFirewall and Komento helper classes, `.phar` pubkeys and the like). Pass it to the scanner to silence those findings:
+
+```
+python3 src/scan_backdoors.py /path/to/site --whitelist data/whitelist-known-clean.txt
+```
+
+In the GUI, set the same file as *Whitelist* on the **Settings** tab. Entries are hashes plus a comment explaining why the file is clean; the false positives of your own project are welcome as pull requests.
 
 ## Launching
 
-The package consists of four files that must stay in the same folder:
+The three scripts in `src/` must stay in the same folder: the GUI looks for `scan_backdoors.py` next to itself and uses `clean_malware.py` next to the scanner.
 
 | File | Purpose |
 |---|---|
-| `scan_backdoors_gui.py` | Browser-based GUI: a small local web server plus a page in your browser (scan, results table, quarantine/delete, mass cleanup) |
-| `scan_backdoors.py` | The scanner (command line) |
-| `clean_malware.py` | Mass cleanup (command line; also used by the GUI "Mass cleanup" button) |
 | `start.bat` | Windows launcher for the GUI |
+| `src/scan_backdoors_gui.py` | Browser-based GUI: a small local web server plus a page in your browser (scan, results table, quarantine/delete, mass cleanup) |
+| `src/scan_backdoors.py` | The scanner (command line) |
+| `src/clean_malware.py` | Mass cleanup (command line; also used by the GUI "Mass cleanup" button) |
 
-Optional files: `emblem_ScanBackDoors_512.png` (the logo; the GUI has a small copy of it built in, so it works without this file) and `scan_backdoors.ico` (an icon for a desktop shortcut to `start.bat`: right-click the shortcut, *Properties*, *Change Icon…*, choose this file).
+Optional files: `assets/emblem_ScanBackDoors_512.png` (the logo; the GUI has a small copy of it built in, so it works without this file) and `assets/scan_backdoors.ico` (an icon for a desktop shortcut to `start.bat`: right-click the shortcut, *Properties*, *Change Icon…*, choose this file).
 
 ### Windows: `start.bat`
 
-Double-click `start.bat`. It switches to its own folder, finds Python (`py -3`, otherwise `python`), starts `scan_backdoors_gui.py` and your default browser opens the page.
+Double-click `start.bat`. It switches to its own folder, finds Python (`py -3`, otherwise `python`), starts `src\scan_backdoors_gui.py` and your default browser opens the page.
 If Python is not found, or the server exits with an error, the window stays open with a hint.
 
 Requirements: Python 3.6+ (tick "Add python.exe to PATH" in the installer from python.org).
@@ -29,9 +57,9 @@ Keep the console window open while you work: closing it stops the server. You ca
 ### Any OS: `scan_backdoors_gui.py`
 
 ```
-python3 scan_backdoors_gui.py                 # start and open the browser
-python3 scan_backdoors_gui.py --no-browser    # start without opening the browser
-python3 scan_backdoors_gui.py --port 9000     # use another port
+python3 src/scan_backdoors_gui.py                 # start and open the browser
+python3 src/scan_backdoors_gui.py --no-browser    # start without opening the browser
+python3 src/scan_backdoors_gui.py --port 9000     # use another port
 ```
 
 ### Open it from a browser bookmark
@@ -40,7 +68,7 @@ The server always uses the same address, **http://127.0.0.1:8765/** (the port is
 Starting the script a second time while it is already running does not start another copy, it only opens the page again.
 If port 8765 is taken by another program, the next free port is used and the console prints the new address (the bookmark then has to be updated).
 
-To have the server running all the time without a console window, on Windows put a shortcut to `pythonw scan_backdoors_gui.py --no-browser` into the Startup folder (`Win+R`, `shell:startup`).
+To have the server running all the time without a console window, on Windows put a shortcut to `pythonw src\scan_backdoors_gui.py --no-browser` into the Startup folder (`Win+R`, `shell:startup`).
 The page remembers the last state (log, results) while the server runs, so you can close and reopen the tab at any moment.
 
 ### Security
@@ -65,6 +93,8 @@ Settings are saved automatically in `~/.scan_backdoors_gui.json` (the same file 
 python3 scan_backdoors.py [folder] [options]
 ```
 
+The examples below are written as if you are inside the `src/` folder; run them from the repository root, prefix the script with `src/` (and the allowlist with `data/`).
+
 If no folder is given, the current one is scanned. **All** folders are checked by default, including `cache`, `tmp`, `logs`, `media`.
 
 ---
@@ -78,8 +108,9 @@ python3 scan_backdoors.py /home/user/site
 # Only the most dangerous findings, last 14 days
 python3 scan_backdoors.py /home/user/site --since 14d --only-critical
 
-# Most accurate check: comparison with a clean Joomla + whitelist
-python3 scan_backdoors.py /home/user/site --baseline-dir /tmp/Joomla_5.1.0 --whitelist whitelist.txt
+# Most accurate check: comparison with a clean Joomla + the shipped known-clean allowlist
+python3 scan_backdoors.py /home/user/site --baseline-dir /tmp/Joomla_5.1.0 \
+    --whitelist data/whitelist-known-clean.txt
 ```
 
 ---
@@ -292,3 +323,37 @@ python3 clean_malware.py /path/to/site --replace-core --baseline-dir /tmp/Joomla
 Safeguards: the site and baseline versions must match (otherwise it refuses); if more than 30% of files are modified, the replacement is cancelled; files that are not in the baseline (extensions, templates, `configuration.php`) are not touched; files from `--whitelist` (your own core edits) are not replaced. Extra files in `libraries/`, `includes/`, `administrator/includes/` (not in the baseline) are only listed for manual review. Rollback: `--restore .../manifest.json`.
 
 **In the GUI:** the "🧹 Mass cleanup" button on the results tab. First a dry run with the numbers, then a confirmation, then the cleanup. The mode (quarantine or permanent), the `filemanager` family and the "Replace modified core files with originals" checkbox (it takes the "Clean Joomla" folder from the settings) are set on the "Settings" tab. `clean_malware.py` must be placed next to the scanner.
+
+---
+
+## Documentation
+
+- **[docs/README_RU.md](docs/README_RU.md)** — Russian command-line reference.
+- **[CHANGELOG.md](CHANGELOG.md)** — what changed in each version.
+- **[SECURITY.md](SECURITY.md)** — what the tool guarantees, what it does not, and how to report a vulnerability.
+
+## Versioning
+
+The scanner, the GUI and the cleaner keep their own `VERSION` and are released
+together under one tag (`v3.0` = GUI 3.0 with scanner 2.1 and cleaner 1.0).
+The GUI refuses nothing when the scanner is older than it expects: it warns that
+exact progress is unavailable. Run `--version` on any of the three scripts to
+see what you have.
+
+## Why no dependencies
+
+Sites get cleaned under pressure, often on a machine with no package access and
+sometimes no internet. The scanner, the GUI and the cleaner run on a stock
+Python 3.6+ and nothing else; XLSX reports are written by hand for the same
+reason. Adding a dependency needs to beat that property, not just look tidier.
+
+## Contributing
+
+The most useful contributions are false positives: an entry for
+`data/whitelist-known-clean.txt` (a SHA-256 plus one line on why the file is
+clean), or a signature for a family the scanner does not yet know. Keep the code
+compatible with Python 3.6 and free of third-party packages.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

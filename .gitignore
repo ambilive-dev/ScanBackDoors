@@ -1,0 +1,27 @@
+# Runtime artifacts produced while the tools work
+__pycache__/
+*.pyc
+
+# reports written next to the current working directory
+report-data.csv
+report-*.csv
+report-*.json
+report-*.xlsx
+
+# whitelist the GUI writes by default (next to scan_backdoors.py)
+src/whitelist.txt
+
+# quarantine created next to a scanned site, and the copies it keeps
+_quarantine_*/
+*.modified
+
+# OS noise
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# never commit real client material: audits, dumps, ACL backups
+*_audit.csv
+*-audit.csv
+acl-backup-*
+acl-report-*
