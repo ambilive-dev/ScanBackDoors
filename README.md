@@ -198,6 +198,8 @@ libraries/vendor/
 components/com_k2/*.php
 ```
 
+A line that is neither a 64-hex hash nor a path (a hex string of another length, binary garbage) is reported by line number and skipped; the scan goes on. A whitelist file that cannot be read at all still stops the run.
+
 ### Performance and output
 
 | Option | Default | Description |

@@ -83,9 +83,10 @@ class ShippedAllowlistTest(unittest.TestCase):
         self.assertFalse(bad, "the allowlist leaks something:\n  " + "\n  ".join(sorted(set(bad))[:10]))
 
     def test_the_scanner_reads_it_without_complaining(self):
-        hashes, paths = sb.load_whitelist(ALLOWLIST)
+        hashes, paths, problems = sb.load_whitelist(ALLOWLIST)
         self.assertEqual(len(hashes), len(set(self.hashes)))
         self.assertEqual(sorted(paths), sorted(self.paths))
+        self.assertEqual(problems, [], "the shipped allowlist must parse without malformed lines")
 
 
 class AllowlistFormatTest(unittest.TestCase):
@@ -102,18 +103,21 @@ class AllowlistFormatTest(unittest.TestCase):
             os.remove(path)
 
     def test_comments_blank_lines_and_case(self):
-        hashes, paths = self.parse("# a comment\n\n  AA00" + "0" * 60 + "  # why it is clean\n")
+        hashes, paths, problems = self.parse("# a comment\n\n  AA00" + "0" * 60 + "  # why it is clean\n")
         self.assertEqual(hashes, {"aa00" + "0" * 60})
         self.assertEqual(paths, [])
+        self.assertEqual(problems, [])
 
     def test_paths_masks_and_normalisation(self):
-        _hashes, paths = self.parse("./components/com_x/\n\\media\\com_y\\\n*.min.js\n/templates/foo.php\n")
+        _hashes, paths, problems = self.parse("./components/com_x/\n\\media\\com_y\\\n*.min.js\n/templates/foo.php\n")
         self.assertEqual(paths, ["components/com_x/", "media/com_y/", "*.min.js", "templates/foo.php"])
+        self.assertEqual(problems, [])
 
-    def test_a_broken_line_is_treated_as_a_path_not_a_hash(self):
-        hashes, paths = self.parse("deadbeef\n")
+    def test_a_broken_line_is_reported_not_silently_a_path(self):
+        hashes, paths, problems = self.parse("deadbeef\n")
         self.assertEqual(hashes, set())
-        self.assertEqual(paths, ["deadbeef"])
+        self.assertEqual(paths, [])
+        self.assertEqual(problems, [(1, "hex string with 8 chars (a SHA-256 needs 64)", "deadbeef")])
 
     def test_path_matching_is_by_folder_or_mask(self):
         self.assertTrue(sb.path_whitelisted("media/com_x/anything.js", ["media/com_x/"]))

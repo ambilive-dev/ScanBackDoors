@@ -1120,17 +1120,27 @@ def parse_since(s):
 
 
 def load_whitelist(path):
-    hashes, paths = set(), []
+    """-> (sha256 set, path patterns, problems).
+
+    problems is a list of (line number, reason, snippet). A malformed line (a hex
+    string of another length, binary garbage) is reported and skipped instead of
+    being silently swallowed: a lost suppression is a false positive, not a missed
+    threat, so the scan must go on."""
+    hashes, paths, problems = set(), [], []
     with io.open(path, encoding="utf-8", errors="replace") as f:
-        for line in f:
-            line = line.split("#", 1)[0].strip()
-            if not line:
+        for line_no, line in enumerate(f, 1):
+            body = line.split("#", 1)[0].strip()
+            if not body:
                 continue
-            if re.match(r"^[0-9a-fA-F]{64}$", line):
-                hashes.add(line.lower())
+            if re.match(r"^[0-9a-fA-F]{64}$", body):
+                hashes.add(body.lower())
+            elif re.match(r"^[0-9a-fA-F]+$", body):
+                problems.append((line_no, "hex string with %d chars (a SHA-256 needs 64)" % len(body), body))
+            elif "\ufffd" in body or any(ord(c) < 32 or c == "\x7f" for c in body):
+                problems.append((line_no, "unprintable content", body[:60]))
             else:
-                paths.append(re.sub(r"^(?:\./|/)+", "", line.replace("\\", "/")))
-    return hashes, paths
+                paths.append(re.sub(r"^(?:\./|/)+", "", body.replace("\\", "/")))
+    return hashes, paths, problems
 
 
 def build_baseline(clean_dir):
@@ -1280,13 +1290,15 @@ def main(argv=None):
             print("Invalid --since format (use 2026-09-01 or 14d)")
             return 1
 
-    wl_hashes, wl_paths = set(), []
+    wl_hashes, wl_paths, wl_problems = set(), [], []
     if args.whitelist:
         try:
-            wl_hashes, wl_paths = load_whitelist(args.whitelist)
+            wl_hashes, wl_paths, wl_problems = load_whitelist(args.whitelist)
         except OSError as e:
             print("Cannot read the whitelist:", e)
             return 1
+        for line_no, reason, snippet in wl_problems:
+            print("whitelist: line %d: %s - ignored: %r" % (line_no, reason, snippet))
 
     baseline = None
     base_dirs = set()
@@ -1426,6 +1438,8 @@ def main(argv=None):
             stats["Skipped (too big)"], stats["Read errors"], stats["Unreadable (Windows permissions)"]))
     print("  Time               : %.1f s" % stats["Time, s"])
     print("=" * 64)
+    if wl_problems:
+        print("whitelist: %d malformed line(s) ignored" % len(wl_problems))
     if dup_counts:
         print("\nNested folders with the same name (a/a), check manually: %d (files inside in parentheses)" % len(dup_counts))
         for pre, n in sorted(dup_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:40]:
