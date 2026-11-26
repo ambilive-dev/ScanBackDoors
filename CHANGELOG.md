@@ -4,6 +4,23 @@ All notable changes to this project are documented here. The bundle has one
 version for all three components; it is written once in `src/version.py` and a
 release is a tag with that number.
 
+## Unreleased
+
+- `--self-test` on all three scripts: a built-in liveness check, no network and no
+  real site needed. The scanner unseals four embedded test payloads into a throwaway
+  folder under `%TEMP%/sbd-fixtures` and each must be detected; the cleaner does the
+  same with one sample per family (htaccess / backdoor / filemanager); the GUI runs
+  a doctor (11 checks: the settings file, the scanner, its version, the cleaner next
+  to it, and the path settings). Exit 0 iff all checks pass.
+- The whitelist loader (`--whitelist`, scanner and cleaner) now reports every
+  malformed line by line number - a hex string of another length, binary garbage -
+  and skips it; the scan goes on instead of silently losing the suppression.
+- The GUI validates all path settings at boot (a bad field is named in the log) and
+  refuses a scan or cleanup job that would run on bad settings; the silent
+  `scanner_path` reset is gone. `--self-test` checks the same things without a server.
+- Release assets now include `sha256sums.txt` with the zip's SHA-256 (retro-attached
+  to v3.1.1 and v3.1); GitHub issue templates added (false positive first).
+
 ## v3.1.1 — 2026-11-26
 
 - Hardening (cleaner): the hash check of a freshly written file - the quarantine
