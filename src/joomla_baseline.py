@@ -102,7 +102,7 @@ def http_download(url, dest_path):
             except (TypeError, ValueError):
                 length = 0
         written = 0
-        step = -1
+        step = 0
         with resp:
             with open(part, "wb") as dst:
                 while True:
@@ -186,7 +186,8 @@ def extract_zip(zip_path, dest_dir):
             name = info.filename
             if prefix:
                 if not name.startswith(prefix):
-                    raise ValueError("Refusing an unsafe path in the archive: %s" % name)
+                    raise ValueError("the archive mixes a top-level folder with root-level files; "
+                                     "cannot determine its layout: %s" % name)
                 name = name[len(prefix):]
             if not name:
                 continue
@@ -316,7 +317,13 @@ def run(version, out_dir, force=False, keep_archive=False, release_url=None):
     except urllib.error.URLError as exc:
         print("Cannot reach the Joomla release API: %s" % exc.reason)
         return 1
-    chosen = pick_full_package(release.get("assets") or [])
+    if not isinstance(release, dict):
+        print("The release API returned a malformed object for Joomla %s; nothing was done." % version)
+        return 1
+    assets = release.get("assets")
+    if not isinstance(assets, list):
+        assets = []
+    chosen = pick_full_package(assets)
     print("Selected %s" % chosen["name"])
     os.makedirs(out_dir, exist_ok=True)
     zip_path = os.path.join(out_dir, "Joomla_%s.zip" % version)
@@ -326,6 +333,9 @@ def run(version, out_dir, force=False, keep_archive=False, release_url=None):
     if isinstance(raw_digest, str) and raw_digest.startswith("sha256:"):
         expected = raw_digest[len("sha256:"):]
     else:
+        if isinstance(raw_digest, str) and raw_digest:
+            print("Warning: the API carries a digest we do not verify (%s); the version self-check applies."
+                  % raw_digest)
         expected = None
     if expected is not None and expected.lower() != actual.lower():
         print("sha256 mismatch: the API reports %s but the archive is %s." % (expected, actual))

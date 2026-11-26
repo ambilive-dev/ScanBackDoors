@@ -293,6 +293,88 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(man["verified_by"], "version-file")
         self.assertEqual(man["version"], "3.7.5")
 
+    def test_mixed_layout_archive_is_refused(self):
+        # one wrapper folder plus a stray root-level file: the layout is
+        # unsupported (not unsafe) and must say so
+        fd, z = h.workfile("sbd-jz-mix-", ".zip")
+        os.close(fd)
+        with zipfile.ZipFile(z, "w") as zf:
+            zf.writestr("Joomla_3.9.27-Stable/index.php", "<?php\necho 1;\n")
+            zf.writestr("Joomla_3.9.27-Stable/libraries/src/Version.php", "x")
+            zf.writestr("stray.txt", "stray")
+        p = release_for(z, "3.9.27")
+        out = h.workdir("sbd-bl-")
+        res = run_fetch("3.9.27", out, p)
+        self.assertEqual(res.returncode, 1, res.out)
+        self.assertIn("mixes a top-level folder with root-level files", res.out)
+        self.assertNotIn("Refusing an unsafe path", res.out)
+        self.assertFalse(os.path.exists(os.path.join(out, "Joomla_3.9.27")))
+
+    def test_malformed_release_object_is_rejected(self):
+        # a mirror can answer with a JSON array; that is an error, not a traceback
+        fd, p = h.workfile("sbd-rel-", ".json")
+        os.close(fd)
+        with open(p, "w") as f:
+            json.dump([1, 2, 3], f)
+        res = h.run(SCRIPT, ["3.9.27", "--out", h.workdir("sbd-bl-"),
+                             "--release-url", Path(p).as_uri()])
+        self.assertEqual(res.returncode, 1, res.out)
+        self.assertIn("malformed object", res.out)
+        self.assertNotIn("Traceback", res.out)
+
+    def test_unverifiable_digest_warns_and_uses_self_check(self):
+        # a digest in a form the tool does not verify (hypothetical sha512:)
+        # must not be treated as verification; the self-check tier applies
+        z = fake_joomla_zip("dg1")
+        p = release_for(z, "3.9.27", digest="sha512:" + "0" * 128)
+        out = h.workdir("sbd-bl-")
+        res = run_fetch("3.9.27", out, p)
+        self.assertEqual(res.returncode, 0, res.out)
+        self.assertIn("we do not verify", res.out)
+        man = h.read_json(os.path.join(out, "Joomla_3.9.27.baseline.json"))
+        self.assertEqual(man["verified_by"], "version-file")
+
+    def test_lost_manifest_refetches(self):
+        # the tree is intact but its manifest was lost: the cache can no longer
+        # be verified offline, so the tool re-downloads and restores it
+        z = fake_joomla_zip("cache5")
+        p = release_for(z, "3.9.27")
+        out = h.workdir("sbd-bl-")
+        self.assertEqual(run_fetch("3.9.27", out, p).returncode, 0)
+        os.remove(os.path.join(out, "Joomla_3.9.27.baseline.json"))
+        res = run_fetch("3.9.27", out, p)
+        self.assertEqual(res.returncode, 0, res.out)
+        self.assertTrue(os.path.isfile(os.path.join(out, "Joomla_3.9.27.baseline.json")))
+        self.assertTrue(os.path.isfile(os.path.join(out, "Joomla_3.9.27", "index.php")))
+
+    def test_progress_never_reports_zero(self):
+        # an archive over 1 MB produces progress lines, and the first is 1 MB
+        # (or 10%), never "Downloaded 0"
+        root = h.workdir("sbd-jz-big-")
+        os.makedirs(os.path.join(root, "libraries", "src"))
+        with open(os.path.join(root, "index.php"), "w") as f:
+            f.write("<?php\necho 1;\n")
+        with open(os.path.join(root, "libraries", "src", "Version.php"), "w") as f:
+            f.write("<?php\n\nclass Version\n{\n\tconst MAJOR_VERSION = 3;\n"
+                    "\tconst MINOR_VERSION = 9;\n\tconst PATCH_VERSION = 27;\n}\n")
+        blob = os.path.join(root, "big.bin")
+        with open(blob, "wb") as f:
+            f.write(os.urandom(1536 * 1024))
+        fd, z = h.workfile("sbd-jz-big-", ".zip")
+        os.close(fd)
+        with zipfile.ZipFile(z, "w") as zf:
+            zf.write(os.path.join(root, "index.php"), "index.php")
+            zf.write(os.path.join(root, "libraries", "src", "Version.php"),
+                     "libraries/src/Version.php")
+            zf.write(blob, "big.bin")
+        shutil.rmtree(root, ignore_errors=True)
+        p = release_for(z, "3.9.27")
+        out = h.workdir("sbd-bl-")
+        res = run_fetch("3.9.27", out, p)
+        self.assertEqual(res.returncode, 0, res.out)
+        self.assertIn("Downloaded", res.out)
+        self.assertNotIn("Downloaded 0", res.out)
+
 
 if __name__ == "__main__":
     unittest.main()
