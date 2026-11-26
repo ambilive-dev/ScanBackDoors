@@ -230,7 +230,7 @@ S(O, "many blank lines before code (hidden code)", r"(?:[ \t]*\r?\n){30,}[ \t]*\
 # Legitimate Joomla code does NOT read $_POST['password'] directly (login goes through the API), so this is a strong indicator.
 # On WordPress the same reads are legitimate core/plugin code, so the heuristic is gated off on detected WP sites.
 HARVEST_C12_LABEL = "credential harvesting: password field read from $_POST"
-S(C, HARVEST_C12_LABEL, r"\$_POST\b[^\n]{0,80}?\[\s*['\"](?:password|passwd|pass|pwd|userpassword|regpass)['\"]", "php", 12)
+S(C, HARVEST_C12_LABEL, r"\$_POST\b[^\n]{0,80}?\[\s*['\"](?:password|passwd|pass|pwd|userpassword|regpass)['\"]\](?!\s*=[^=])", "php", 12)
 # ---- OBFUSCATED: data store hidden in an image (steganography) ----
 S(O, "custom X- response header (self-advertising marker)", r"\bheader\s*\(\s*@?\s*['\"]X-[\w\-]{2,40}[:\"]", "php", 8)
 S(O, "GIF magic bytes handled in PHP (image used as a data container)", r"GIF8[79]a", "php", 3)
@@ -641,10 +641,10 @@ def php_anomalies(raw, text, folder=None, rel=""):
 # 3b) CORRELATION: several weak signatures in ONE file = credential harvester
 # ---------------------------------------------------------------------------
 
-HARVEST_POST_RX = re.compile(r"\$_POST\b[^\n]{0,80}?\[\s*['\"](?:password|passwd|pass|pwd|userpassword|regpass)['\"]")
+HARVEST_POST_RX = re.compile(r"\$_POST\b[^\n]{0,80}?\[\s*['\"](?:password|passwd|pass|pwd|userpassword|regpass)['\"]\](?!\s*=[^=])")
 HARVEST_SINKS = [
     ("file write", re.compile(r"\b(?:file_put_contents|fwrite|fputs)\s*\(")),
-    ("response-header leak", re.compile(r"\bheader\s*\(\s*@?\s*['\"][^'\n]{0,60}:")),
+    ("response-header leak", re.compile(r"\bheader\s*\(\s*@?\s*['\"]X-[^'\n]{0,60}:")),
     ("database write", re.compile(r"\b(?:insertGetId|insertGetNewId|updateObject|saveObject|__query__)\s*\(")),
     ("error_log", re.compile(r"\berror_log\s*\(")),
 ]
