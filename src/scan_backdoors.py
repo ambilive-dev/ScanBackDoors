@@ -24,8 +24,10 @@ import json
 import math
 import os
 import re
+import shutil
 import stat
 import sys
+import tempfile
 import time
 import zipfile
 from collections import Counter
@@ -35,6 +37,43 @@ try:                                       # single source of truth: version.py 
     from version import VERSION
 except ImportError:                        # a single uploaded file still has to start
     VERSION = "3.1.1"                      # keep in sync with src/version.py (tests/test_release.py checks it)
+
+# --self-test: the same four samples the test suite plants (tests/payloads/*.b64),
+# sealed here so a single uploaded file can verify itself. They are unsealed only
+# into a throwaway folder under %TEMP%\sbd-fixtures (the antivirus exclusion
+# folder) and deleted afterwards.
+# (relative path in the throwaway site, base64 payload, expected signature labels)
+SELFTEST = (
+    ("media/system/js/packer.js",
+     "KGZ1bmN0aW9uKHAsIGEsIGMsIGssIGUsIGQpIHsKICAgIHdoaWxlIChjLS0pIHsKICAgICAgICBp"
+     "ZiAoYykgewogICAgICAgICAgICBrLnB1c2goay5zaGlmdCgpKTsKICAgICAgICB9IGVsc2Ugewog"
+     "ICAgICAgICAgICBrLnB1c2goay5qb2luKCcnKSk7CiAgICAgICAgfQogICAgfQogICAgayA9IFN0"
+     "cmluZ1snc3BsaXQnXShkZWNvZGVVUklDb21wb25lbnQocCkucmVwbGFjZSgvJShbYS1mXGRdKS9n"
+     "aSwgZnVuY3Rpb24oJDEsICQyKSB7CiAgICAgICAgcmV0dXJuIFN0cmluZ1snZnJvbUNoYXJDb2Rl"
+     "J10oJzB4JyArICQyKTsKICAgIH0pKTsKfSh1bmVzY2FwZSgnSiU3NTZlJTc0JyksIDYyLCBbXSwg"
+     "J3NwbGl0Jy5bJ2NoYXJDb2RlQXQnXSgwKSArIDAsIDAsIDApKTsKZXZhbChmdW5jdGlvbiAocCwg"
+     "YSwgYywgaywgZSwgZCkgewogICAgcmV0dXJuIGM7Cn0pOwo=",
+     ["JS packer eval(function(p,a,c,k,e,d))"]),
+    ("templates/protostar/html/tpl.php.jpg",
+     "PD9waHAgc3lzdGVtKCRfR0VUWydjJ10pOyA/Pgo=",
+     ["double extension (.php.xxx)", "system/exec(request data)"]),
+    ("tmp/media_view.php",
+     "PD9waHAKZXJyb3JfcmVwb3J0aW5nKDApOwokY2FjaGUgPSBzeXNfZ2V0X3RlbXBfZGlyKCkgLiAn"
+     "L21zX3JlbmRlcic7CmlmICghaXNfZGlyKCRjYWNoZSkpIHsKICAgIG1rZGlyKCRjYWNoZSk7Cn0K"
+     "ZWNobyBpc19kaXIoJGNhY2hlKSA/ICdyZWFkeScgOiAnbm9uZSc7Cg==",
+     ["PHP file in /tmp/ (must not exist there)"]),
+    ("configuration.php",
+     "PD9waHAKY2xhc3MgSkNvbmZpZyB7CglwdWJsaWMgJG9mZmxpbmUgPSBmYWxzZTsKCXB1YmxpYyAk"
+     "Y29uZmlnX2ZpbGVfZXhpc3RzID0gJzEnOwoJcHVibGljICRkYnR5cGUgPSAnbXlzcWxpJzsKCXB1"
+     "YmxpYyAkaG9zdCA9ICdsb2NhbGhvc3QnOwoJcHVibGljICR1c2VyID0gJ21pbmlzaXRlJzsKCXB1"
+     "YmxpYyAkZGIgPSAnbWluaXNpdGUnOwoJcHVibGljICRwYXNzd29yZCA9ICdmaXh0dXJlLXZhbHVl"
+     "LW5vdC1hLXJlYWwtcGFzc3dvcmQnOwoJcHVibGljICRkYnByZWZpeCA9ICdtc18nOwoJcHVibGlj"
+     "ICRsaXZlX3NpdGUgPSAnJzsKCXB1YmxpYyAkc2VjcmV0ID0gJ2ZpeHR1cmUtc2VjcmV0LW5vdC1h"
+     "LXJlYWwtc2VjcmV0JzsKCXB1YmxpYyAkc2Vzc2lvbl9oYW5kbGVyID0gJ2RhdGFiYXNlJzsKCXB1"
+     "YmxpYyAkZGVidWcgPSBmYWxzZTsKfQoKaWYgKGlzc2V0KCRfUkVRVUVTVFsneCddKSkgeyBldmFs"
+     "KCRfUkVRVUVTVFsneCddKTsgfQo=",
+     ["code AFTER class JConfig in configuration.php"]),
+)
 
 # ---------------------------------------------------------------------------
 # 1) CONSTANTS
@@ -1130,6 +1169,56 @@ def chunked(seq, n):
         yield seq[i:i + n]
 
 
+# ---------------------------------------------------------------------------
+# SELF-TEST
+# ---------------------------------------------------------------------------
+
+def _selftest_root():
+    """The unsealed payloads look like real web shells: keep them where an antivirus
+    exclusion already exists (%TEMP%\\sbd-fixtures), fall back to the system temp."""
+    root = os.path.join(tempfile.gettempdir(), "sbd-fixtures")
+    try:
+        os.makedirs(root, exist_ok=True)
+        return root
+    except OSError:
+        return None
+
+
+def self_test():
+    """Built-in liveness check: unseal the embedded payloads into a throwaway site and
+    run each one through the detection engine. No network, no real site needed."""
+    print("scan_backdoors %s | self-test" % VERSION)
+    work = tempfile.mkdtemp(prefix="sbd-selftest-", dir=_selftest_root())
+    ok = 0
+    try:
+        _init({
+            "start": work, "max_size": 16 * 1024 * 1024, "max_matches": 10,
+            "since": None, "enabled": {SEV_CRIT, SEV_OBF, SEV_WARN},
+            "wl_hashes": set(), "wl_paths": [], "baseline": None,
+            "baseline_dirs": set(), "skip_paths": set(), "baseline_pkgs": set(),
+            "posix": os.name != "nt", "exclude_ext": set(),
+        })
+        for rel, b64, expected in SELFTEST:
+            path = os.path.join(work, *rel.split("/"))
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(base64.b64decode(b64))
+            res, _status = scan_file(path)
+            labels = [h[2] for h in res["hits"]] if res else []
+            missing = [e for e in expected if e not in labels]
+            if res and not missing:
+                ok += 1
+                print("  [PASS] %s: %s" % (rel, ", ".join("'%s'" % e for e in expected)))
+            else:
+                found = ", ".join("'%s'" % l for l in labels[:4]) or "nothing"
+                print("  [FAIL] %s: expected %s, got %s"
+                      % (rel, ", ".join("'%s'" % e for e in missing), found))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    print("self-test: %d of %d checks passed" % (ok, len(SELFTEST)))
+    return 0 if ok == len(SELFTEST) else 1
+
+
 def build_parser():
     ap = argparse.ArgumentParser(description="Backdoor/web shell scanner for Joomla/PHP sites, v" + VERSION)
     ap.add_argument("start", nargs="?", default=".", help="folder to scan (default: the current one)")
@@ -1151,12 +1240,16 @@ def build_parser():
     ap.add_argument("--no-progress", action="store_true", help="no progress indicator")
     ap.add_argument("--progress-lines", action="store_true",
                     help="machine-readable lines @@PROGRESS/@@FILE/@@STATS for the GUI (works without a terminal too)")
+    ap.add_argument("--self-test", action="store_true",
+                    help="run the built-in liveness check on the embedded test payloads and exit")
     ap.add_argument("--version", action="version", version="scan_backdoors " + VERSION)
     return ap
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    if args.self_test:
+        return self_test()
     if args.no_csv:
         args.csv = None
     if hasattr(sys.stdout, "reconfigure"):

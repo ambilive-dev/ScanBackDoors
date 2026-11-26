@@ -205,6 +205,7 @@ components/com_k2/*.php
 | `--workers N` | `0` (auto) | Number of processes. `0` = auto (up to 4), `1` = no parallelism. If parallel mode is unavailable on the host, the script falls back to a single thread by itself. |
 | `--no-progress` | | Do not show the progress indicator. |
 | `--progress-lines` | | Print machine-readable lines `@@PROGRESS`, `@@FILE`, `@@STATS`, `@@DONE`. Needed by the GUI (progress bar, report buttons); works without a terminal too. |
+| `--self-test` | | Run the built-in liveness check: four embedded test payloads are unsealed into a throwaway folder under `%TEMP%/sbd-fixtures` (the antivirus exclusion folder) and each must be detected. Exit 0 if all are detected. |
 | `--version` | | Show the version. |
 | `-h`, `--help` | | Option help. |
 
