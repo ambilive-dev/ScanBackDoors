@@ -202,5 +202,64 @@ class BackdoorFamilyTest(unittest.TestCase):
         self.assertEqual(h.sha256(target), original)
 
 
+J37_VERSION = (
+    "<?php\n"
+    "defined('_VERSION') or die;\n"
+    "final class JVersion\n"
+    "{\n"
+    "\tconst RELEASE = '3.7';\n"
+    "\tconst DEV_LEVEL = '5';\n"
+    "\tconst DEV_STATUS = 'Stable';\n"
+    "}\n"
+)
+LEGACY_VERSION = "<?php\n$RELEASE = '1.5';\n$DEV_LEVEL = '1';\n"
+
+
+def joomla_tree(name, version_php, version_rel):
+    """A minimal Joomla tree: index.php plus one version file at version_rel."""
+    root = h.workdir("sbd-jm-%s-" % name)
+    with open(os.path.join(root, "index.php"), "w") as f:
+        f.write("<?php\ndefined('_JEXEC') or die;\n")
+    path = os.path.join(root, version_rel)
+    os.makedirs(os.path.dirname(path))
+    with open(path, "w") as f:
+        f.write(version_php)
+    return root
+
+
+class VersionDetectionTest(unittest.TestCase):
+    """--replace-core needs both versions: Joomla 3.7 and earlier use const RELEASE."""
+
+    def _replace_core(self, site, base):
+        report_dir = h.workdir("sbd-clean-")
+        return h.run("clean_malware.py",
+                     [site, "--replace-core", "--baseline-dir", base,
+                      "--report", os.path.join(report_dir, "cleanup.csv")],
+                     cwd=report_dir)
+
+    def test_j37_site_and_baseline_are_detected(self):
+        site = joomla_tree("j37s", J37_VERSION, "libraries/cms/version/version.php")
+        base = joomla_tree("j37b", J37_VERSION, "libraries/cms/version/version.php")
+        res = self._replace_core(site, base)
+        self.assertEqual(res.returncode, 0, res.out)
+        self.assertIn("site 3.7.5 | baseline 3.7.5", res.out)
+        self.assertIn("Building the baseline", res.out)
+        self.assertNotIn("REFUSED", res.out)
+
+    def test_mismatched_versions_are_still_refused(self):
+        site = joomla_tree("mx1", J37_VERSION, "libraries/cms/version/version.php")
+        base = joomla_tree("mx2", J37_VERSION, "libraries/src/Version.php")  # wrong layout: undetermined
+        res = self._replace_core(site, base)
+        self.assertEqual(res.returncode, 1, res.out)
+        self.assertIn("REFUSED", res.out)
+
+    def test_legacy_dollar_release_style_still_parses(self):
+        site = joomla_tree("leg1", LEGACY_VERSION, "libraries/cms/version/version.php")
+        base = joomla_tree("leg2", LEGACY_VERSION, "libraries/cms/version/version.php")
+        res = self._replace_core(site, base)
+        self.assertEqual(res.returncode, 0, res.out)
+        self.assertIn("site 1.5.1 | baseline 1.5.1", res.out)
+
+
 if __name__ == "__main__":
     unittest.main()
