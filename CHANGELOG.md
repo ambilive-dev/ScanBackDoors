@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The bundle has one
 version for all three components; it is written once in `src/version.py` and a
 release is a tag with that number.
 
-## Unreleased
+## v3.3 — 2026-11-27
 
 External code review of v3.2: findings verified against the code, fixes and
 regression tests added (the reviewer's tests are adapted to the test harness).

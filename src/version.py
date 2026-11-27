@@ -12,7 +12,7 @@ without its neighbours there. tests/test_release.py compares the fallbacks with
 this file, so the copies can never drift apart silently.
 """
 
-VERSION = "3.2"
+VERSION = "3.3"
 
 # Oldest scan_backdoors.py the GUI can drive: it needs the @@PROGRESS / @@STATS
 # marker lines introduced with scanner 2.1 (see build_scan_command in the GUI).
