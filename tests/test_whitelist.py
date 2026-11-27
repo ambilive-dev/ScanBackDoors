@@ -121,7 +121,11 @@ class AllowlistFormatTest(unittest.TestCase):
 
     def test_path_matching_is_by_folder_or_mask(self):
         self.assertTrue(sb.path_whitelisted("media/com_x/anything.js", ["media/com_x/"]))
-        self.assertTrue(sb.path_whitelisted("media/com_x/anything.js", ["*.js"]))
+        # a mask never spans folders: "*.js" is a top-level file, not any .js anywhere;
+        # an in-folder mask keeps working
+        self.assertFalse(sb.path_whitelisted("media/com_x/anything.js", ["*.js"]))
+        self.assertTrue(sb.path_whitelisted("anything.js", ["*.js"]))
+        self.assertTrue(sb.path_whitelisted("media/com_x/anything.js", ["media/com_x/*.js"]))
         self.assertFalse(sb.path_whitelisted("media/com_x/anything.js", ["media/com_y/"]))
         self.assertFalse(sb.path_whitelisted("media/com_xextra/a.js", ["media/com_x/"]))
 
