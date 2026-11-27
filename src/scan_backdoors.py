@@ -173,6 +173,9 @@ TAINT_SRC = (r"(?:\s*" + RQ + r"\s*\[\s*['\"][^'\"]+['\"]\s*\]"
 # shell.php ship there, so the FM/webshell-name heuristics are gated off for them
 # on detected WordPress sites.
 WP_CORE_PREFIXES = ("wp-includes/", "wp-admin/")
+# The ONLY core files exempt from the webshell-filename check (exact paths, lower-case).
+# A folder-wide exemption would hide a shell dropped as wp-admin/c99.php.
+WP_SHELL_NAME_EXEMPT = {"wp-includes/text/diff/engine/shell.php"}
 
 # ---- CRITICAL: PHP ----
 S(C, "eval(request data)", r"\beval\s*\(\s*@?\s*(?:base64_decode\s*\(\s*)?" + RQ, "php", 25)
@@ -455,7 +458,7 @@ def snippet_at(text, nl, idx, m, at_end):
 # characters: same length, newlines in the same places.
 # ---------------------------------------------------------------------------
 
-PHP_COMMENT_EDGE_RX = re.compile(r"<\?|>\?|//|/\*|['\"]|#")
+PHP_COMMENT_EDGE_RX = re.compile(r"<\?|\?>|//|/\*|['\"]|#")
 PHP_TAG_OPEN_RX = re.compile(r"<\?(?:php\b|=|[ \t])", re.I)
 
 
@@ -524,6 +527,9 @@ def mask_php_comments(text):
         else:                      # // or #
             j = text.find("\n", s)
             j = n if j < 0 else j
+            k = text.find("?>", s, j)
+            if k >= 0:
+                j = k              # PHP ends a line comment at a closing tag: what follows is live code
             blank(s, j)
             until = j
     return "".join(out) if out is not None else text
@@ -952,7 +958,8 @@ def verdict_of(score):
 def path_whitelisted(rel, patterns):
     for p in patterns:
         if any(ch in p for ch in "*?["):
-            if fnmatch.fnmatch(rel, p):
+            # a mask never spans folders: 'a/*.php' is a/x.php, not a/b/c/x.php
+            if rel.count("/") == p.count("/") and fnmatch.fnmatch(rel, p):
                 return True
         elif rel == p or rel.startswith(p.rstrip("/") + "/"):
             return True
@@ -992,7 +999,7 @@ def scan_file(path):
         # Joomla-specific name heuristics do not apply to a WordPress site.
         hits = [h for h in hits
                 if h[2] != "WordPress-style filename (wp-*.php) in Joomla"
-                and not (h[2] == "typical webshell filename" and rel.startswith(WP_CORE_PREFIXES))]
+                and not (h[2] == "typical webshell filename" and rel.lower() in WP_SHELL_NAME_EXEMPT)]
     if os.path.splitext(name.lower())[1] in cfg["exclude_ext"]:
         return None, "skip"
     try:
@@ -1010,8 +1017,11 @@ def scan_file(path):
         return None, "skip"
     if cfg["since"] and st.st_mtime < cfg["since"]:
         return None, "old"
+    audit = False
     if path_whitelisted(rel, cfg["wl_paths"]):
-        return None, "whitelisted"
+        if not cfg.get("audit_wl"):
+            return None, "whitelisted_path"      # content NOT scanned: counted separately in the statistics
+        audit = True                             # --audit-whitelisted: still look, but report [CRITICAL] only
 
     phpish = (kind == "php")
     if st.st_size > cfg["max_size"]:
@@ -1046,7 +1056,7 @@ def scan_file(path):
         elif rel.startswith(CORE_PREFIXES) or ("/" not in rel and name.lower() != "configuration.php"):
             hits.append((O, 0, "file is not part of clean Joomla", rel, 10))
 
-    enabled = cfg["enabled"]
+    enabled = cfg["enabled"] & {SEV_CRIT} if audit else cfg["enabled"]
     if kind in ("php", "htaccess"):
         hits += dupdir_hits(rel)
     if kind == "media":
@@ -1068,7 +1078,7 @@ def scan_file(path):
                     hits.append((C, line_no, "PHP code inside a non-PHP file (%s)" % kind, name, 15))
                 else:
                     if not (name.lower().endswith(".phpt") or raw[:2] == b"#!"):
-                        hits.append((O, line_no, "PHP tag inside a %s file" % kind, name, 6))
+                        hits.append((O, line_no, "PHP tag inside a %s file" % (kind or "non-PHP"), name, 6))
         else:
             if raw[:4] in (b"GIF8",) or raw[:3] == b"\xff\xd8\xff" or raw[:4] == b"\x89PNG":
                 hits.append((C, 1, "image magic bytes at the start of a PHP file", name, 25))
@@ -1092,6 +1102,8 @@ def scan_file(path):
 
 
 def scan_batch(paths):
+    if not CFG:     # a worker that never got its configuration must fail loudly, not report "error" for every file
+        raise RuntimeError("scanner worker is not initialised (no configuration)")
     results, counters = [], Counter()
     for p in paths:
         try:
@@ -1102,6 +1114,15 @@ def scan_batch(paths):
         if res:
             results.append(res)
     return results, dict(counters)
+
+
+def scan_batch_cfg(args):
+    """Pool entry point for Python < 3.7 (no pool initializer): the configuration travels with the batch.
+    Needed wherever workers are spawned rather than forked (Windows)."""
+    paths, cfg = args
+    if not CFG:
+        _init(cfg)
+    return scan_batch(paths)
 
 
 # ---------------------------------------------------------------------------
@@ -1382,9 +1403,17 @@ def detect_cms(start):
         entries = {e.lower() for e in os.listdir(start)}
     except OSError:
         return None
-    if "wp-config.php" in entries or "wp-load.php" in entries or "wp-settings.php" in entries:
+    # One planted file must not flip the decision (it would switch off the CMS-specific
+    # checks for the whole site): WordPress needs a marker file AND both core folders,
+    # and conflicting evidence means "ambiguous", which suppresses nothing.
+    wp = bool(entries & {"wp-config.php", "wp-load.php", "wp-settings.php"}) \
+        and {"wp-includes", "wp-admin"} <= entries
+    joomla = "configuration.php" in entries or "administrator" in entries
+    if wp and joomla:
+        return "ambiguous"
+    if wp:
         return "wp"
-    if "configuration.php" in entries or "administrator" in entries:
+    if joomla:
         return "joomla"
     return None
 
@@ -1393,6 +1422,10 @@ def iter_paths(start, excl_dirs):
     for root, dirs, files in os.walk(start):
         if excl_dirs:
             dirs[:] = [d for d in dirs if d not in excl_dirs]
+        for d in dirs:                       # os.walk lists a symlink to a folder here and never enters it
+            p = os.path.join(root, d)
+            if os.path.islink(p):
+                yield p                      # scan_file reports it as "symlink inside web root"
         for n in files:
             yield os.path.join(root, n)
 
@@ -1469,6 +1502,10 @@ def build_parser():
     ap.add_argument("--exclude-ext", default="", help="comma-separated extensions: .js,.json")
     ap.add_argument("--exclude-dir", default="", help="comma-separated folder names (ALL folders are scanned by default)")
     ap.add_argument("--whitelist", help="file: SHA-256, paths, folders (with a trailing /) or masks *; # - comment")
+    ap.add_argument("--audit-whitelisted", action="store_true",
+                    help="do not skip files that match a whitelist PATH/folder/mask: scan them and report [CRITICAL] only")
+    ap.add_argument("--strict", action="store_true",
+                    help="exit code 3 when files could not be processed (the scan is incomplete) and nothing critical was found")
     ap.add_argument("--baseline-dir", help="folder with a CLEAN Joomla of the same version (where index.php lives)")
     ap.add_argument("--workers", type=int, default=0, help="number of processes (0 = auto, 1 = no parallelism)")
     ap.add_argument("--no-progress", action="store_true", help="no progress indicator")
@@ -1550,12 +1587,14 @@ def main(argv=None):
         "baseline_pkgs": set("/".join(r.split("/")[:4]) for r in (baseline or {}) if r.startswith("libraries/vendor/")), "posix": os.name != "nt",
         "exclude_ext": set(e.strip().lower() if e.strip().startswith(".") else "." + e.strip().lower()
                            for e in args.exclude_ext.split(",") if e.strip()),
-        "cms": cms,
+        "cms": cms, "audit_wl": args.audit_whitelisted,
     }
     excl_dirs = set(d.strip() for d in args.exclude_dir.split(",") if d.strip())
 
     print("scan_backdoors %s | scanning '%s' ..." % (VERSION, start))
-    if cms:
+    if cms == "ambiguous":
+        print("site CMS: ambiguous (WordPress and Joomla markers both present): CMS-specific suppressions are OFF")
+    elif cms:
         print("site CMS: %s (root-file heuristic: gates the CMS-specific heuristics)"
               % ("WordPress" if cms == "wp" else "Joomla"))
     t0 = time.time()
@@ -1591,7 +1630,11 @@ def main(argv=None):
             from concurrent.futures import ProcessPoolExecutor
             kw = {"initializer": _init, "initargs": (cfg,)} if sys.version_info >= (3, 7) else {}
             with ProcessPoolExecutor(max_workers=workers, **kw) as ex:
-                for b, res in zip(batches, ex.map(scan_batch, batches)):
+                if sys.version_info >= (3, 7):
+                    jobs = ex.map(scan_batch, batches)
+                else:
+                    jobs = ex.map(scan_batch_cfg, [(b, cfg) for b in batches])
+                for b, res in zip(batches, jobs):
                     handle(res)
                     progress(len(b))
                     done += 1
@@ -1636,7 +1679,9 @@ def main(argv=None):
         "Files flagged": len(results), "HIGH": ver_tot["HIGH"], "MEDIUM": ver_tot["MEDIUM"], "LOW": ver_tot["LOW"],
         "[CRITICAL] hits": sev_tot[SEV_CRIT], "[OBFUSCATED] hits": sev_tot[SEV_OBF], "[WARNING] hits": sev_tot[SEV_WARN],
         "Identical to clean Joomla (skipped)": stats_c.get("core_ok", 0),
-        "Whitelisted": stats_c.get("whitelisted", 0), "Skipped (too big)": stats_c.get("big", 0),
+        "Whitelisted": stats_c.get("whitelisted", 0),
+        "Whitelisted by path (content NOT scanned)": stats_c.get("whitelisted_path", 0),
+        "Skipped (too big)": stats_c.get("big", 0),
         "Skipped (older than --since)": stats_c.get("old", 0), "Read errors": stats_c.get("error", 0),
         "Unreadable (Windows permissions)": stats_c.get("unreadable", 0),
         "Time, s": round(time.time() - t0, 1),
@@ -1666,6 +1711,11 @@ def main(argv=None):
         print("  Skipped            : too large %d, read errors %d, NOT READABLE (Windows permissions) %d" % (
             stats["Skipped (too big)"], stats["Read errors"], stats["Unreadable (Windows permissions)"]))
     print("  Time               : %.1f s" % stats["Time, s"])
+    if stats["Whitelisted by path (content NOT scanned)"]:
+        print("  Whitelisted by path: %d (content NOT scanned; --audit-whitelisted looks at them)"
+              % stats["Whitelisted by path (content NOT scanned)"])
+    if stats["Read errors"]:
+        print("  WARNING            : %d file(s) could not be processed - the scan is INCOMPLETE" % stats["Read errors"])
     print("=" * 64)
     if wl_problems:
         print("whitelist: %d malformed line(s) ignored" % len(wl_problems))
@@ -1700,7 +1750,9 @@ def main(argv=None):
 
     emit("STATS", json.dumps(stats, ensure_ascii=False))
     emit("DONE", str(sev_tot[SEV_CRIT]))
-    return 2 if sev_tot[SEV_CRIT] else 0
+    if sev_tot[SEV_CRIT]:
+        return 2
+    return 3 if (args.strict and stats["Read errors"]) else 0
 
 
 if __name__ == "__main__":

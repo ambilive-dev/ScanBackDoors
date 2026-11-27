@@ -42,6 +42,18 @@ RELEASE_URL_TEMPLATE = "https://api.github.com/repos/joomla/joomla-cms/releases/
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 
 
+def require_official_https(url):
+    """The download URL taken from the release metadata must be HTTPS on GitHub's own hosts.
+    (The module docstring promises HTTPS only; this makes it true. An explicit --release-url
+    is the user's own choice and is not restricted.)"""
+    from urllib.parse import urlparse
+    u = urlparse(url or "")
+    host = (u.hostname or "").lower()
+    official = host in ("api.github.com", "github.com") or host.endswith(".githubusercontent.com")
+    if u.scheme != "https" or not official:
+        raise ValueError("Refusing a download URL that is not HTTPS on GitHub: %s" % (url or "(empty)"))
+
+
 def validate_version(value):
     """True for a full stable version like 3.9.27 (nothing else passes)."""
     return bool(VERSION_RE.match(value))
@@ -119,6 +131,8 @@ def http_download(url, dest_path):
                     elif written // (1 << 20) > step:
                         step = written // (1 << 20)
                         print("Downloaded %d MB of the archive" % step)
+        if length and written != length:
+            raise ValueError("the download is incomplete (%d of %d bytes)" % (written, length))
         os.replace(part, dest_path)
     except BaseException:
         _remove(part)
@@ -324,6 +338,8 @@ def run(version, out_dir, force=False, keep_archive=False, release_url=None):
     if not isinstance(assets, list):
         assets = []
     chosen = pick_full_package(assets)
+    if release_url is None:
+        require_official_https(chosen.get("browser_download_url"))
     print("Selected %s" % chosen["name"])
     os.makedirs(out_dir, exist_ok=True)
     zip_path = os.path.join(out_dir, "Joomla_%s.zip" % version)
@@ -346,9 +362,11 @@ def run(version, out_dir, force=False, keep_archive=False, release_url=None):
     tmp = os.path.join(out_dir, ".tmp-%s" % version)
     try:
         extract_zip(zip_path, tmp)
-    except ValueError:
+    except (ValueError, zipfile.BadZipFile) as exc:
         _remove(tmp)
         _remove(zip_path)
+        if isinstance(exc, zipfile.BadZipFile):
+            raise ValueError("the archive is not a valid zip file (truncated or corrupted download?): %s" % exc)
         raise
     detected = parse_joomla_version(tmp)
     if verified_by == "version-file":
@@ -362,6 +380,12 @@ def run(version, out_dir, force=False, keep_archive=False, release_url=None):
             _remove(zip_path)
             print("the distribution reports Joomla %s but %s was requested; nothing was kept." % (detected, version))
             return 1
+    elif detected is not None and detected != version:
+        # the sha256 proves the file is what the API listed, not that the release is the one asked for
+        _remove(tmp)
+        _remove(zip_path)
+        print("the distribution reports Joomla %s but %s was requested; nothing was kept." % (detected, version))
+        return 1
     _remove(tree)
     try:
         os.replace(tmp, tree)
