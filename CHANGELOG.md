@@ -4,6 +4,66 @@ All notable changes to this project are documented here. The bundle has one
 version for all three components; it is written once in `src/version.py` and a
 release is a tag with that number.
 
+## Unreleased
+
+External code review of v3.2: findings verified against the code, fixes and
+regression tests added (the reviewer's tests are adapted to the test harness).
+
+**False negatives closed (missed backdoors):**
+
+- Scanner: a `//` or `#` line comment no longer swallows the rest of the line
+  when the line contains a closing tag: PHP ends a line comment at `?>`, so
+  `<?php // note ?><?php system($_GET['c']); ?>` is masked only up to `?>` and
+  the live code after it is scanned. Previously the whole line was blanked and
+  the shell went unreported.
+- Scanner: on detected WordPress the webshell-name exemption is now the single
+  legitimate core file `wp-includes/Text/Diff/Engine/shell.php` (exact path)
+  instead of the whole `wp-includes/` + `wp-admin/` folders, which also hid a
+  dropped `wp-admin/c99.php`.
+- Scanner: one planted `wp-load.php` no longer flips a Joomla site to "WordPress"
+  (which would have switched off the Joomla-specific checks for the whole site):
+  WordPress now needs a marker file *and* both core folders, and conflicting
+  evidence yields `ambiguous` - CMS-specific suppressions stay off.
+- Scanner: a symlink to a directory inside the web root is now reported
+  ("symlink inside web root"). `os.walk` lists such links but never enters or
+  reports them; a directory link is a classic place to hide a shell folder.
+- Scanner and cleaner: a whitelist mask never spans folders -
+  `components/com_k2/*.php` matches `components/com_k2/x.php` but no longer
+  `components/com_k2/sub/x.php` (fnmatch's `*` crosses `/`). **Behaviour
+  change**: existing `*`-style entries in user whitelist files cover less;
+  use the trailing-slash folder form for a whole folder.
+- Cleaner: `--restore` no longer trusts the manifest blindly. A file is
+  restored only inside the site folder recorded in the manifest, and only if
+  the quarantined copy still matches its recorded SHA-256 (the manifest lives
+  next to the quarantine, where a compromised account can write); a violation
+  is `[REFUSED]` with exit code 2.
+
+**Robustness:**
+
+- Scanner: on Python 3.6 + Windows (`--workers > 1`) the pool workers were never
+  initialised (the pool `initializer` argument is 3.7+), so every file silently
+  counted as an error and the scan reported nothing. The configuration now
+  travels with the batch on 3.6, and an uninitialised worker fails loudly
+  (`RuntimeError`) instead of returning "error" per file.
+- Scanner: "PHP tag inside a None file" for unknown extensions is now "PHP tag
+  inside a non-PHP file".
+- Cleaner: the same no-folder-spanning mask rule as the scanner.
+- Baseline: a download shorter than its `Content-Length` is refused (it used to
+  be kept as the final archive), a truncated/corrupt zip is an explained error
+  instead of a `BadZipFile` traceback, a download URL taken from the release
+  API must be HTTPS on GitHub's own hosts (the docstring promised this, the
+  code did not check), and a sha256-verified release is still cross-checked
+  against the version the distribution reports.
+
+**New options:**
+
+- Scanner: `--audit-whitelisted` - scan files matched by a path/folder/mask
+  whitelist entry and report `[CRITICAL]` hits only (off by default).
+- Scanner: `--strict` - exit code 3 (instead of 0) when there are no critical
+  findings but some files could not be read, i.e. the scan is incomplete.
+  The summary gains a separate "Whitelisted by path (content NOT scanned)"
+  counter and an INCOMPLETE warning when files could not be processed.
+
 ## v3.2 — 2026-11-27
 
 - Scanner: webshell detection no longer requires the request array to be written

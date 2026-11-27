@@ -180,6 +180,7 @@ python3 scan_backdoors.py . --max-matches 20
 | Option | Description |
 |---|---|
 | `--whitelist FILE` | A file with exclusions (format below). |
+| `--audit-whitelisted` | Do not skip files matched by a path/folder/mask whitelist entry: scan them and report `[CRITICAL]` hits only. A path-based entry normally keeps the file's content out of the scan entirely; this flag is for whitelisted folders (say, a vendor directory) that must stay quiet for everything except a real web shell. Off by default. |
 | `--baseline-dir FOLDER` | A folder with a **clean** Joomla of the same version (where `index.php` lives). Files that match by SHA-256 are skipped as clean. Modified and extra files in `libraries/`, `includes/`, `administrator/includes/` and in the root are flagged. |
 
 ```bash
@@ -203,6 +204,8 @@ libraries/vendor/
 components/com_k2/*.php
 ```
 
+A mask never spans folders: `components/com_k2/*.php` matches `components/com_k2/x.php` but not `components/com_k2/sub/x.php`. For a whole folder use the trailing-slash form (`libraries/vendor/`) instead.
+
 A line that is neither a 64-hex hash nor a path (a hex string of another length, binary garbage) is reported by line number and skipped; the scan goes on. A whitelist file that cannot be read at all still stops the run.
 
 ### Performance and output
@@ -210,6 +213,7 @@ A line that is neither a 64-hex hash nor a path (a hex string of another length,
 | Option | Default | Description |
 |---|---|---|
 | `--workers N` | `0` (auto) | Number of processes. `0` = auto (up to 4), `1` = no parallelism. If parallel mode is unavailable on the host, the script falls back to a single thread by itself. |
+| `--strict` | | Exit with code `3` (instead of `0`) when there are no `[CRITICAL]` findings but some files could not be read: the scan is incomplete and "clean" is not proven. For CI/cron. |
 | `--no-progress` | | Do not show the progress indicator. |
 | `--progress-lines` | | Print machine-readable lines `@@PROGRESS`, `@@FILE`, `@@STATS`, `@@DONE`. Needed by the GUI (progress bar, report buttons); works without a terminal too. |
 | `--self-test` | | Run the built-in liveness check: four embedded test payloads are unsealed into a throwaway folder under `%TEMP%/sbd-fixtures` (the antivirus exclusion folder) and each must be detected. Exit 0 if all are detected. |
@@ -268,6 +272,7 @@ What the script additionally checks:
 |---|---|
 | `0` | No critical findings |
 | `2` | There are `[CRITICAL]` findings |
+| `3` | With `--strict`: no critical findings, but some files could not be read (incomplete scan) |
 | `1` | Startup error (folder not found, invalid option format) |
 
 Automation example (cron, CI):
@@ -313,7 +318,7 @@ python3 clean_malware.py /path/to/site --apply --delete # delete permanently
 | `--exclude-dir` | empty | Folder names to leave alone. |
 | `--whitelist` | off | The same format as in the scanner: SHA-256, paths, folders (trailing `/`), masks `*`. |
 | `--report` | `cleanup-report.csv` | CSV: status, family, action, file, size, hash, error. |
-| `--restore MANIFEST` | | Restore files from quarantine. For cleaned `.htaccess` files it restores the original content. |
+| `--restore MANIFEST` | | Restore files from quarantine. For cleaned `.htaccess` files it restores the original content. The manifest is not trusted blindly: a file is restored only inside the site folder recorded in the manifest, and only if the quarantined copy still matches its recorded SHA-256. A tampered manifest or a swapped quarantine copy is refused (`[REFUSED]`, exit `2`). |
 | `--replace-core` | off | Replace modified Joomla core files with originals from `--baseline-dir`. `--apply` is required to execute. The modified file is kept in quarantine (`*.modified`), the original is written over it in place (owner and permissions are kept), the hash is verified after writing. |
 | `--baseline-dir` | | A folder with a clean full Joomla distribution of the **same version** (where `index.php` lives). |
 | `--core-ext` | `.php,.js,.html,.htm` | Extensions that are replaced. Language `.ini` files are not touched by default (translators edit them). |
@@ -325,7 +330,7 @@ python3 clean_malware.py /path/to/site --apply --delete # delete permanently
 
 **How it stays safe:** quarantine with hash verification before deletion; files with 0444 permissions and 0555 directories are handled (directory permissions are restored); symbolic links are skipped; a repeated run finds nothing.
 
-Exit codes: `0` success, `1` startup error (including a baseline version mismatch), `2` some files could not be processed.
+Exit codes: `0` success, `1` startup error (including a baseline version mismatch), `2` some files could not be processed or a `--restore` entry was refused.
 
 **Replacing core files (example):**
 ```
@@ -357,7 +362,7 @@ joomla-baselines/Joomla_3.9.27.baseline.json   <- manifest: every file and its s
 | `--force` | re-download even when the cached baseline is valid |
 | `--keep-archive` | keep the downloaded zip |
 
-A re-run verifies the cached baseline offline (no network) and re-downloads only if a file changed. The resulting folder is accepted by both `scan_backdoors.py --baseline-dir` and `clean_malware.py --replace-core --baseline-dir`. The tool talks to `api.github.com` and GitHub's download CDN over HTTPS only.
+A re-run verifies the cached baseline offline (no network) and re-downloads only if a file changed. The resulting folder is accepted by both `scan_backdoors.py --baseline-dir` and `clean_malware.py --replace-core --baseline-dir`. The tool talks to `api.github.com` and GitHub's download CDN over HTTPS only: a download URL taken from the release API must point at those hosts, a truncated download (fewer bytes than `Content-Length`) and a corrupted archive are reported as a clear error, never left behind as a partial baseline.
 
 ---
 
