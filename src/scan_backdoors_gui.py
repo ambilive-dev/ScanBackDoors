@@ -527,6 +527,7 @@ class App(object):
         self.settings = dict(DEFAULTS)
         self.log, self.log_first = [], 0          # before _load_config: boot errors must be loggable
         self._load_config()
+        self.migrate_data_locations()      # old next-to-the-scanner data -> the data folder
         self.job = None
         self.status = "Ready to run"
         self.idle_text = ""
@@ -939,8 +940,8 @@ class App(object):
         if not hashes:
             raise ApiError("The report has no SHA-256 for the selected files.")
         wl = self.s("whitelist_path").strip()
-        if not wl:                                   # a browser has no 'save as' dialog: default next to the scanner
-            wl = str(Path(self.s("scanner_path")).expanduser().resolve().parent / "whitelist.txt")
+        if not wl:                                   # a browser has no 'save as' dialog: the data folder
+            wl = self._whitelist_default()
             self.update_settings({"whitelist_path": wl})
         try:
             wl_path = Path(wl).expanduser()
@@ -1180,7 +1181,7 @@ class App(object):
         tool = scanner.resolve().parent / "joomla_baseline.py"
         if not tool.is_file():
             raise ApiError("joomla_baseline.py was not found next to the scanner.")
-        out = scanner.resolve().parent / "joomla-baselines"
+        out = Path(self._baselines_dir())          # the data folder, not the folder of the code
         folder = out / ("Joomla_" + v)
         cmd = [python_exe(), "-u", str(tool), v, "--out", str(out)]
         self._start_job("baseline", cmd)
@@ -1191,13 +1192,75 @@ class App(object):
                 self.job["baseline_version"] = v
         return {"ok": True, "version": v, "folder": str(folder)}
 
+    # ------------------------------------------------------------- data folder
+    # What the tools keep between runs - the whitelist they may append to, the Joomla
+    # baseline cache, the YARA rule cache, the installed signature releases - lives in
+    # ONE folder: $SBD_DATA_DIR or ~/.scan_backdoors. Never next to the code, never
+    # inside a scanned site. Older versions wrote some of it next to the scanner; that
+    # is moved once on startup (migrate_data_locations).
+    def _data_root(self):
+        d = os.environ.get("SBD_DATA_DIR") or os.path.join(os.path.expanduser("~"), ".scan_backdoors")
+        return os.path.abspath(os.path.expanduser(d))
+
+    def _whitelist_default(self):
+        """Where 'Add to whitelist' writes when the user did not pick a file."""
+        return os.path.join(self._data_root(), "whitelist.txt")
+
+    def _baselines_dir(self):
+        return os.path.join(self._data_root(), "joomla-baselines")
+
+    def migrate_data_locations(self):
+        """Move what used to live next to the scanner into the data folder and point
+        the settings at the new place. -> list of (old, new) that were moved."""
+        try:
+            tools = Path(self.s("scanner_path")).expanduser().resolve().parent
+        except (OSError, RuntimeError):
+            return []
+        moved = []
+        pairs = [(tools / "whitelist.txt", Path(self._whitelist_default())),
+                 (tools / "joomla-baselines", Path(self._baselines_dir()))]
+        for old, new in pairs:
+            if not old.exists() or new.exists() or old.parent == new.parent:
+                continue
+            try:
+                if not new.parent.is_dir():
+                    new.parent.mkdir(parents=True)
+                shutil.move(str(old), str(new))
+                moved.append((str(old), str(new)))
+            except OSError:
+                pass                        # a locked folder: the job that needs it will say so
+        if not moved:
+            return []
+        changed = False
+        for key in ("whitelist_path", "baseline_dir"):
+            value = str(self.s(key) or "").strip()
+            if not value:
+                continue
+            try:
+                value_abs = os.path.abspath(os.path.expanduser(value))
+            except (OSError, ValueError):
+                continue
+            for old, new in moved:
+                if os.path.normcase(value_abs) == os.path.normcase(old):
+                    self.settings[key] = new
+                elif value_abs.startswith(old + os.sep):
+                    self.settings[key] = new + value_abs[len(old):]
+                else:
+                    continue
+                changed = True
+                break
+        if changed:
+            self.update_settings({}, save=True)
+            for old, new in moved:
+                self.log_add("Data moved: %s -> %s\n" % (old, new))
+        return moved
+
     # ------------------------------------------------------------- signatures
     # The signature package is managed by src/updater.py. The browser never sends a
     # URL or a path here: the sources are updater's own constants/config, the work
     # runs as a background subprocess job, and the status is read from the manifest.
     def _signatures_root(self):
-        d = os.environ.get("SBD_DATA_DIR") or os.path.join(os.path.expanduser("~"), ".scan_backdoors")
-        return os.path.abspath(os.path.expanduser(d))
+        return self._data_root()
 
     def _active_rules_dir(self):
         """The rules folder of the ACTIVE release, or None (validated exactly like
@@ -3428,7 +3491,7 @@ async function fetchBaseline(autoScan) {
     const d = await api('/api/baseline/detect', {});
     const yes = await confirmDlg('Download the clean Joomla ' + d.version + ' baseline?',
       'The site looks like Joomla ' + d.version + '.\n\n' +
-      'The tool will download the official Full_Package from the joomla/joomla-cms GitHub releases over HTTPS, verify it, and unpack it into the joomla-baselines folder next to the scanner. When it finishes, the Clean Joomla folder setting is filled in automatically.\n\n' +
+      'The tool will download the official Full_Package from the joomla/joomla-cms GitHub releases over HTTPS, verify it, and unpack it into the joomla-baselines folder of your Scan Backdoors data folder (~/.scan_backdoors, or $SBD_DATA_DIR). When it finishes, the Clean Joomla folder setting is filled in automatically.\n\n' +
       'This is the only part of the app that reaches the internet, and only after this confirmation.',
       'Download');
     if (!yes) return;

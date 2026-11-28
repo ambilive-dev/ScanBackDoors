@@ -12,8 +12,12 @@ cleanup-report.csv
 # the GUI's own settings file, kept next to the home directory, never in the repo
 .scan_backdoors_gui.json
 
-# whitelist the GUI writes by default (next to scan_backdoors.py)
+# the GUI's whitelist: it lives in the data folder now, this only catches an old copy
+# (or one written next to the scanner by a previous version)
 src/whitelist.txt
+
+# the tools' data folder, if someone points SBD_DATA_DIR inside the repo
+.scan_backdoors/
 
 # the local Joomla baseline cache written by joomla_baseline.py
 joomla-baselines/

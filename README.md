@@ -38,6 +38,20 @@ python3 src/scan_backdoors.py /path/to/site --whitelist data/whitelist-known-cle
 
 In the GUI, set the same file as *Whitelist* on the **Settings** tab. Entries are hashes plus a comment explaining why the file is clean; the false positives of your own project are welcome as pull requests.
 
+## Where the tools keep their data
+
+Everything the tools keep between runs lives in ONE folder: **`$SBD_DATA_DIR`**, or `~/.scan_backdoors` when that variable is empty (on Windows `%USERPROFILE%\.scan_backdoors`). Never next to the code, never inside a scanned site.
+
+```
+<data>/yarac/                the compiled .yarac rule cache (scanner --yara-cache)
+<data>/whitelist.txt         the file the GUI's "Add to whitelist" appends to (until you pick another one)
+<data>/joomla-baselines/     baselines downloaded by joomla_baseline.py (also the GUI's *Fetch baseline*)
+<data>/signatures/           installed rule releases + ACTIVE + manifest.json + sources.json (updater.py)
+<data>/logs/updater.log      what the updater did (rotating, secrets masked)
+```
+
+The GUI moves what older versions kept next to the scanner (`whitelist.txt`, `joomla-baselines/`) into this folder on startup and updates its own settings accordingly; the scanner does the same with a rule cache left in the temp folder, and `joomla_baseline.py` with a cache left next to itself. Nothing is merged or deleted: an existing destination wins and the old copy simply stays where it is (a baseline that turns out to be missing is downloaded again, a missing cache is rebuilt). Pointing `SBD_DATA_DIR` at a folder on a USB stick or a scratch disk is fine - the tools only ever put their own files there.
+
 ## Launching
 
 The scripts in `src/` must stay in the same folder: the GUI looks for `scan_backdoors.py` next to itself, uses `clean_malware.py` next to the scanner, and `updater.py` next to itself for signature updates.
@@ -279,7 +293,7 @@ The scanner can additionally run [YARA](https://github.com/VirusTotal/yara) rule
 |---|---|---|
 | `--yara-rules PATH` | | A `.yar`/`.yara` file, or a folder of them (non-recursive). Every hit appears as a signature `YARA: <file>.<rule>`. A rule's `meta` may set `severity` (critical/high/medium/low/…) and `score` (1-50); a rule without meta is always a `[WARNING]`. Rules may use the bound externals `file_name`, `extension`, `path`, `folder`, `file_size`, `cms`, `wp_root`, `joomla_root`, `rule_language`. A rule file that fails to compile is reported and skipped - the rest keep working. `include` directives are refused: every rule file must stand on its own. |
 | `--no-yara` | | Never run the YARA engine, even with `--yara-rules` given. |
-| `--yara-cache DIR` | `%TEMP%/scan-backdoors-yarac` | Folder for the compiled `.yarac` cache (keyed by rule content; a corrupt cache file is rebuilt automatically). |
+| `--yara-cache DIR` | `<data>/yarac` | Folder for the compiled `.yarac` cache (keyed by rule content; a corrupt cache file is rebuilt automatically). `<data>` is `$SBD_DATA_DIR` or `~/.scan_backdoors` (see [Where the tools keep their data](#where-the-tools-keep-their-data)); an old cache left in the temp folder is moved there automatically. |
 | `--no-yara-cache` | | Do not read or write the `.yarac` cache; compile in every process. |
 | `--yara-timeout SEC` | `5` | Per-file time limit for the YARA scan. A file that hits the limit is reported as a scan gap (`[WARNING]` hit + a STATISTICS line), never as clean. |
 
@@ -438,13 +452,13 @@ python3 joomla_baseline.py 3.9.27
 downloads the official Joomla 3.9.27 Full_Package from the `joomla/joomla-cms` GitHub releases, verifies it (the API sha256 digest when the API provides one, otherwise the version of the unpacked distribution must match the request), unpacks it, and writes a hash manifest:
 
 ```
-joomla-baselines/Joomla_3.9.27/                <- pass this folder as --baseline-dir
-joomla-baselines/Joomla_3.9.27.baseline.json   <- manifest: every file and its sha256
+<data>/joomla-baselines/Joomla_3.9.27/                <- pass this folder as --baseline-dir
+<data>/joomla-baselines/Joomla_3.9.27.baseline.json   <- manifest: every file and its sha256
 ```
 
 | flag | meaning |
 |---|---|
-| `--out DIR` | cache directory (default: `joomla-baselines` in the current directory) |
+| `--out DIR` | cache directory (default: `joomla-baselines` inside the [data folder](#where-the-tools-keep-their-data); a cache that still lives next to the script is moved there once) |
 | `--force` | re-download even when the cached baseline is valid |
 | `--keep-archive` | keep the downloaded zip |
 

@@ -159,7 +159,7 @@ class BaselineFetchTest(unittest.TestCase):
                     "a = sys.argv[1:]\n"
                     "out = pathlib.Path(a[a.index('--out') + 1])\n"
                     "d = out / ('Joomla_' + a[0])\n"
-                    "(d / 'libraries').mkdir(parents=True)\n"
+                    "(d / 'libraries').mkdir(parents=True, exist_ok=True)\n"
                     "(d / 'index.php').write_text('<?php // stub baseline\\n')\n")
         with h.Gui(home) as gui:
             gui.api("POST", "/api/settings", {"settings": {"site_dir": site, "scanner_path": stub}})
@@ -175,7 +175,9 @@ class BaselineFetchTest(unittest.TestCase):
                 time.sleep(0.5)
             baseline_dir = gui.settings()["baseline_dir"]
         self.assertIn("Baseline ready", state.get("status") or "")
-        expected = os.path.join(tools, "joomla-baselines", "Joomla_3.10.12")
+        # the baseline cache is data, not code: it belongs to the data folder, not to
+        # the folder of the stub tools (SBD_DATA_DIR is set by the harness)
+        expected = os.path.join(h.data_dir(), "joomla-baselines", "Joomla_3.10.12")
         self.assertEqual(os.path.normpath(baseline_dir), os.path.normpath(expected))
 
 

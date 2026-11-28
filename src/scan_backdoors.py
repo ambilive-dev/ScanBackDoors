@@ -340,6 +340,49 @@ def _init(cfg):
     CFG = cfg
 
 
+# ---------------------------------------------------------------------------
+# the data folder: what the tools keep between runs lives here - never next to
+# the code, never inside a scanned site (the updater and the GUI use the same root)
+# ---------------------------------------------------------------------------
+
+LEGACY_YARAC_DIR = os.path.join(tempfile.gettempdir(), "scan-backdoors-yarac")
+
+
+def data_root():
+    """$SBD_DATA_DIR, otherwise ~/.scan_backdoors; the temp folder when there is
+    no home directory to write to (a scanner copied to a bare server)."""
+    d = os.environ.get("SBD_DATA_DIR")
+    if d:
+        return os.path.abspath(os.path.expanduser(d))
+    home = os.path.expanduser("~")
+    if not home or home == "~":
+        return os.path.join(tempfile.gettempdir(), "scan-backdoors")
+    return os.path.join(home, ".scan_backdoors")
+
+
+def default_yarac_dir():
+    """Where the compiled .yarac files live by default (--yara-cache overrides it)."""
+    return os.path.join(data_root(), "yarac")
+
+
+def migrate_yarac_cache():
+    """Move the old temp-folder cache into the data folder once (OPEN_QUESTIONS #3).
+
+    It is only a cache: when anything goes wrong the rules are simply recompiled,
+    so this never fails a scan and never deletes anything the user cannot lose."""
+    new_dir = default_yarac_dir()
+    if not os.path.isdir(LEGACY_YARAC_DIR) or os.path.exists(new_dir):
+        return False
+    try:
+        parent = os.path.dirname(new_dir)
+        if not os.path.isdir(parent):
+            os.makedirs(parent)
+        shutil.move(LEGACY_YARAC_DIR, new_dir)
+        return True
+    except OSError:
+        return False
+
+
 def yara_key(spec):
     """Stable per-process cache key for one --yara-rules configuration."""
     return (tuple(spec["sources"]), spec["cache"], float(spec["timeout"]),
@@ -1732,7 +1775,7 @@ def build_parser():
                                          "are reported and skipped")
     ap.add_argument("--no-yara", action="store_true", help="never run the YARA engine, even with --yara-rules")
     ap.add_argument("--yara-cache", default="", help="folder for the compiled .yarac cache "
-                                                     "(default: scan-backdoors-yarac in the temp folder)")
+                                                     "(default: yarac in the data folder - $SBD_DATA_DIR or ~/.scan_backdoors)")
     ap.add_argument("--no-yara-cache", action="store_true", help="do not read or write the .yarac cache")
     ap.add_argument("--yara-timeout", type=float, default=5.0,
                     help="YARA time limit per file in seconds (5): a file that hits the limit is reported "
@@ -1838,8 +1881,9 @@ def main(argv=None):
         except ValueError as e:
             print("YARA:", e)
             return 1
-        cache_dir = "" if args.no_yara_cache else (args.yara_cache or
-                        os.path.join(tempfile.gettempdir(), "scan-backdoors-yarac"))
+        cache_dir = "" if args.no_yara_cache else (args.yara_cache or default_yarac_dir())
+        if cache_dir and not args.yara_cache and migrate_yarac_cache():
+            print("YARA: the compiled-rule cache moved to %s" % cache_dir)
         yara_ext = {"cms": {"wp": "wordpress", "joomla": "joomla"}.get(cms, ""),
                     "wp_root": cms == "wp", "joomla_root": cms == "joomla"}
         yara_eng, yara_problems = build_yara_engine(

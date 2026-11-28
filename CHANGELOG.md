@@ -5,6 +5,19 @@ version for all components; it is written once in `src/version.py` and a
 release is a tag with that number.
 
 ## Unreleased
+- One data folder (OPEN_QUESTIONS #3): everything the tools keep between runs now lives in
+   `$SBD_DATA_DIR` (or `~/.scan_backdoors`) - the `.yarac` rule cache (`<data>/yarac`),
+   the whitelist the GUI appends to (`<data>/whitelist.txt`), the Joomla baseline cache
+   (`<data>/joomla-baselines/`) and the installed signature releases. Nothing is written
+   next to the code or inside a scanned site any more. What older versions kept there is
+   moved into the data folder once, and nothing is merged or deleted while doing it: the
+   GUI moves `whitelist.txt` and `joomla-baselines/` on startup and updates its own
+   `whitelist_path`/`baseline_dir` settings, the scanner moves a rule cache left in the
+   temp folder before its first YARA scan, `joomla_baseline.py` a cache left next to
+   itself; when the destination already exists the old copy simply stays where it is (a
+   missing baseline is downloaded again, a missing cache is rebuilt). `--yara-cache` and
+   `--out` keep their meaning and still override the location - no flag changed shape.
+   Tests: `tests/test_data_paths.py`.
 - Signature updates (TZ v2 Sprint 2): a new shipped tool, `src/updater.py`, installs
   YARA rule packages for the optional engine and nothing else. Trust model: a rule set
   becomes active only as a whole and only after checks - download (HTTPS only, host

@@ -104,20 +104,24 @@ package» (1054–1055).
 | cleaner | файлы `.quarantine/.orig/.modified` — рядом с оригиналом **внутри сайта** (304/326/343); правки на месте (329–350, chmod 361, откат 367); удаление `os.unlink` (309, 318) | внутри сайта — только когда пользователь явно дал `--apply` |
 | cleaner | манифест карантина | `<qdir>/manifest.json` (740–741); отчёт `--report` дефолт `cleanup-report.csv` (497, 748) |
 | cleaner `--restore` | восстановление | только внутрь сайта из манифеста, с проверкой sha256 (384–427) |
-| baseline | кэш | `<--out дефолт joomla-baselines от cwd>/<Joomla_ver>/` + `<...>.baseline.json`; `.part`, `.tmp-<ver>`, атомарные `os.replace` (97–136, 310–391) |
+| baseline | кэш | `<--out дефолт <данные>/joomla-baselines>/<Joomla_ver>/` + `<...>.baseline.json`; `.part`, `.tmp-<ver>`, атомарные `os.replace` (97–136, 310–391); перенос старого кэша из папки скрипта — `migrate_legacy_baselines` |
 | GUI | настройки | `~/.scan_backdoors_gui.json` (`CONFIG_PATH` 45; запись `update_settings` 575) |
 | GUI | библиотека AI-подписей | `~/.scan_backdoors_user_signatures.json` (`USER_SIGS_PATH` 49–50; атомарно 1732–1734) |
-| GUI | whitelist append | путь из настройки `whitelist_path`; **если не задан — `<папка сканера>/whitelist.txt`** (942–944) |
+| GUI | whitelist append | путь из настройки `whitelist_path`; **если не задан — `<данные>/whitelist.txt`** (`_whitelist_default`) |
 | GUI | CSV-отчёт | три атомарных переписывания колонок `Delete` / `AI Verdict/AI Comment/AI Handled` (902–931, 1521–1560, 1749–1781) |
 | GUI | карантины по одному | `<родитель сайта>/_quarantine_<сайт>/<timestamp>` + `manifest.txt` (857–866) |
-| GUI | Fetch baseline | запускает `joomla_baseline.py --out <папка файла сканера>/joomla-baselines` (1173–1178) |
+| GUI | Fetch baseline | запускает `joomla_baseline.py --out <данные>/joomla-baselines` (`_baselines_dir`) |
+| сканер | кэш `.yarac` | `--yara-cache`, по умолчанию `<данные>/yarac`; перенос старого кэша из `%TEMP%/scan-backdoors-yarac` — `migrate_yarac_cache` |
+| updater | релизы правил, манифест, лог | `<данные>/signatures/{releases,ACTIVE,manifest.json,sources.json}`, `<данные>/logs/updater.log`; staging в `<данные>/signatures/releases/.staging-*` (та же ФС), временные пакеты в `%TEMP%`, удаляются в `finally` |
+| GUI | перенос данных | `migrate_data_locations()` при старте: `<папка сканера>/whitelist.txt` и `/joomla-baselines` → `<данные>/`, с правкой настроек `whitelist_path`/`baseline_dir` |
 | GUI | прочее | в сканируемый сайт пишет только при явных действиях пользователя (quarantine/delete/mass cleanup) |
 
 **Вывод для ТЗ §2.3:** сканер в сканируемый сайт не пишет вообще; карантин по
 умолчанию лежит ВНЕ сайта (в его родителе), правки внутри сайта — только явный
-`--apply` чистильщика. Два места «рядом со сканером» (этно-каталог `whitelist.txt`
-по умолчанию и `joomla-baselines/` из Fetch baseline) — кандидаты на перенос в
-каталог данных; зафиксировано в OPEN_QUESTIONS.
+`--apply` чистильщика. Всё, что инструменты хранят между запусками (кэш правил,
+этно-каталог `whitelist.txt`, `joomla-baselines/`, релизы подписей), лежит в одном
+каталоге данных (`$SBD_DATA_DIR` / `~/.scan_backdoors`) — переезд закрыт в Спринте
+2.5, OPEN_QUESTIONS #3.
 
 ---
 

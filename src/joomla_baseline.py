@@ -41,6 +41,49 @@ except ImportError:
 RELEASE_URL_TEMPLATE = "https://api.github.com/repos/joomla/joomla-cms/releases/tags/%s"
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 
+# The baseline cache is data, not code: it belongs to the data folder (the same root
+# updater.py uses), not to the current directory or the folder of this script. Older
+# versions wrote it next to this script (that is where the GUI put it) - that cache is
+# moved once, see migrate_legacy_baselines().
+LEGACY_BASELINE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "joomla-baselines")
+
+
+def data_root():
+    """$SBD_DATA_DIR, otherwise ~/.scan_backdoors; the temp folder when there is no home."""
+    import tempfile
+    d = os.environ.get("SBD_DATA_DIR")
+    if d:
+        return os.path.abspath(os.path.expanduser(d))
+    home = os.path.expanduser("~")
+    if not home or home == "~":
+        return os.path.join(tempfile.gettempdir(), "scan-backdoors")
+    return os.path.join(home, ".scan_backdoors")
+
+
+def default_out_dir():
+    """Where the cache goes when --out is not given."""
+    return os.path.join(data_root(), "joomla-baselines")
+
+
+def migrate_legacy_baselines(out_dir):
+    """Move the cache that used to live next to this script into --out. -> bool.
+
+    Only when --out does not exist yet: nothing is merged and nothing is deleted,
+    a baseline that turns out to be missing is simply downloaded again."""
+    target = os.path.abspath(out_dir)
+    if os.path.normcase(LEGACY_BASELINE_DIR) == os.path.normcase(target):
+        return False
+    if not os.path.isdir(LEGACY_BASELINE_DIR) or os.path.exists(target):
+        return False
+    try:
+        parent = os.path.dirname(target)
+        if not os.path.isdir(parent):
+            os.makedirs(parent)
+        shutil.move(LEGACY_BASELINE_DIR, target)
+        return True
+    except OSError:
+        return False
+
 
 def require_official_https(url):
     """The download URL taken from the release metadata must be HTTPS on GitHub's own hosts.
@@ -411,8 +454,9 @@ def build_parser():
                     "verify it, and cache it unpacked with a sha256 manifest. Pass the "
                     "resulting folder as --baseline-dir to the scanner or the cleaner.")
     p.add_argument("version", help="the exact stable version, for example 3.9.27")
-    p.add_argument("--out", default="joomla-baselines",
-                   help="cache directory (default: joomla-baselines in the current directory)")
+    p.add_argument("--out", default=None,
+                   help="cache directory (default: joomla-baselines in the data folder - "
+                        "$SBD_DATA_DIR or ~/.scan_backdoors)")
     p.add_argument("--force", action="store_true",
                    help="re-download even when the cached baseline is valid")
     p.add_argument("--keep-archive", action="store_true",

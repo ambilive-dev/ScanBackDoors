@@ -28,7 +28,11 @@ DATA = os.path.join(REPO, "data")
 WHITELIST = os.path.join(DATA, "whitelist-known-clean.txt")
 
 PYTHON = sys.executable
-ENV = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1", PYTHONUNBUFFERED="1")
+# SBD_DATA_DIR: the tools keep their data (rule cache, baselines, whitelist, signature
+# releases) in one folder - a test run must never write into the developer's real
+# ~/.scan_backdoors and never consume the real %TEMP% rule cache.
+ENV = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1", PYTHONUNBUFFERED="1",
+           SBD_DATA_DIR=os.path.join(fx.fixtures_root(), "data"))
 
 # printed when a test file never reached the tool that needed it
 AV_HINT = ("a test file disappeared or could not be read - real-time protection is "
@@ -64,6 +68,15 @@ def have_yara():
         return importlib.util.find_spec("yara") is not None
     except (ImportError, ValueError):
         return False
+
+
+def data_dir():
+    """The data folder the tools use under this harness (created when needed): the
+    rule cache, the baseline cache, the GUI whitelist, the installed rule releases."""
+    d = ENV["SBD_DATA_DIR"]
+    if not os.path.isdir(d):
+        os.makedirs(d)
+    return d
 
 
 def run(script, args, cwd=None, timeout=600, env=None):

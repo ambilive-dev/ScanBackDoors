@@ -162,7 +162,24 @@ class PublishedTreeTest(unittest.TestCase):
     LOCAL_PATHS = [r"(?i)[a-z]:\\(?:users|program files|web|www|inetpub|home|ai|xampp|tmp)\b",
                    r"(?i)[a-z]:\\[a-z0-9_.\-]{1,20}\\[a-z0-9_.\-]{1,20}\\"]
     EMAILS = re.compile(r"[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})")
+    # a URL written with credentials (https://user:pw@host/x.zip) is not somebody's
+    # contact address: the tools have to test exactly that form, so the guard tells
+    # the two apart instead of forcing fake hosts into URL tests.
+    EMAIL_BREAK = " \t\r\n'\"`()<>,;[]{}"
     PLACEHOLDER_DOMAINS = {"example.com", "example.org", "example.net", "example.edu"}
+
+    def emails_in(self, text):
+        """The contact addresses found in text, credentials in URLs left out."""
+        found = []
+        for match in self.EMAILS.finditer(text):
+            domain = match.group(1)
+            if domain.lower() in self.PLACEHOLDER_DOMAINS:
+                continue
+            head = max([text.rfind(ch, 0, match.start()) for ch in self.EMAIL_BREAK] + [-1])
+            if "//" in text[head + 1:match.start()]:     # https://user:pw@host/...
+                continue
+            found.append(domain)
+        return found
 
     def tracked_files(self):
         return [ln for ln in (git(["ls-files"]) or "").splitlines() if ln.strip()]
@@ -188,10 +205,21 @@ class PublishedTreeTest(unittest.TestCase):
             for pattern in self.LOCAL_PATHS:
                 if re.search(pattern, text):
                     bad.append("%s: local path %s" % (path, pattern))
-            for domain in self.EMAILS.findall(text):
-                if domain.lower() not in self.PLACEHOLDER_DOMAINS:
-                    bad.append("%s: e-mail address %s" % (path, domain))
+            for domain in self.emails_in(text):
+                bad.append("%s: e-mail address %s" % (path, domain))
         self.assertFalse(bad, "the published tree leaks something:\n  " + "\n  ".join(sorted(set(bad))))
+
+    def test_the_guard_reads_credentials_not_addresses(self):
+        # the sample addresses are assembled here so that this file itself stays clean
+        at, dot = "@", "."
+        self.assertEqual(self.emails_in("write person" + at + "acme-corp" + dot + "ru first"),
+                         ["acme-corp" + dot + "ru"])
+        self.assertEqual(self.emails_in('mail = "boss' + at + 'acme-corp' + dot + 'io"'),
+                         ["acme-corp" + dot + "io"])
+        # the credential of a URL is not an address (updater's own tests use this form)
+        self.assertEqual(self.emails_in('up.check_url("https://user:pw@github.com/x.zip")'), [])
+        # and a placeholder domain is still fine wherever it appears
+        self.assertEqual(self.emails_in("https://user:pw@evil.example.com/x"), [])
 
     def test_gitignore_covers_what_the_tools_write(self):
         """Reports, quarantines and the GUI's whitelist must never be committable."""
