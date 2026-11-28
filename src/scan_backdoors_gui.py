@@ -43,6 +43,11 @@ DEFAULT_PORT = 8765
 PORT_FALLBACK_SPAN = 100    # how many consecutive ports the startup loop tries (see _pick_port)
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = Path.home() / ".scan_backdoors_gui.json"
+
+# The library of AI-prepared signatures the user confirms in the GUI.
+# The scanner reads it via --user-signatures on the next scan.
+USER_SIG_FILENAME = ".scan_backdoors_user_signatures.json"
+USER_SIGS_PATH = Path.home() / USER_SIG_FILENAME
 API_HEADER = "X-Requested-With"
 API_HEADER_VALUE = "scan-backdoors-gui"
 MAX_TABLE_ROWS = 5000          # a bigger table is heavy for the browser; the full list is in the CSV
@@ -51,14 +56,322 @@ LEVEL_ORDER = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
 # Files whose deletion may "take the site down": the server insists on an extra confirmation
 PROTECTED_FILES = {"configuration.php", "index.php", ".htaccess", "administrator/index.php"}
 
+# The signature library: bounded proposal calls per real-threat file (mirrors the review bounds)
+AI_SIGNATURE_MAX_FILES = 5       # at most this many real-threat files get a proposal
+AI_SIGNATURE_MAX_TOKENS = 700    # max answer size for a proposal
+AI_SIGNATURE_REASON_MAX = 400
+AI_SIGNATURE_LABEL_MAX = 120
+USER_SIG_KINDS = ("php", "js", "html", "htaccess", "ini", "text")
+USER_SIG_SEVERITIES = ("critical", "obfuscated", "warning")
+
 DEFAULTS = {
     "scanner_path": str(HERE / "scan_backdoors.py"), "site_dir": "", "csv_path": str(Path.cwd() / "report-data.csv"),
     "xlsx_path": "", "json_path": "", "baseline_dir": "", "whitelist_path": "", "since": "", "max_size": "5",
     "max_matches": "60", "min_score": "0", "workers": "0", "exclude_ext": "", "exclude_dir": "",
     "only_critical": False, "no_warnings": False, "no_csv": False, "auto_open": False,
     "clean_permanent": False, "clean_fm": False, "clean_core": False,
+    "ai_enabled": False, "ai_base_url": "http://127.0.0.1:8080/v1", "ai_model": "",
 }
 BOOL_KEYS = {k for k, v in DEFAULTS.items() if isinstance(v, bool)}
+
+# ------------------------------------------------------------------------------
+# Local AI - review of suspicious files against a localhost model
+# ------------------------------------------------------------------------------
+AI_HOSTS = {"127.0.0.1", "localhost", "::1"}
+# The file contents and snippets are sent to the endpoint, so the endpoint must stay on localhost.
+AI_MAX_CONTENT = 24000        # max chars of file context sent per file
+AI_MAX_FINDINGS = 5           # max findings sent per file
+AI_MAX_FILES = 100            # a local model is slow: the review stops after this many unique files
+AI_CONTEXT_LINES = 8          # lines above/below a finding line, included in the prompt
+AI_START_BYTES = 2000         # the first bytes of the file, included in the prompt
+AI_PROMPT_FILE_BYTES = 65536  # max bytes read from a file to build the context
+AI_TIMEOUT = 180              # per-request timeout (seconds) - a local model can be slow
+AI_VALID_STATUSES = ("real_threat", "false_positive", "uncertain", "error")
+AI_COMMENT_MAX = 1200
+
+
+def validate_ai_endpoint(url):
+    """Validate the configured AI endpoint. -> (ok, reason).
+
+    The endpoint must stay on localhost: the file contents and snippets are sent
+    to it, so nothing outside the machine may ever be contacted by this URL."""
+    raw = str(url or "").strip()
+    if not raw:
+        return False, "the AI base URL is empty"
+    try:
+        parts = urlparse(raw)
+    except ValueError:
+        return False, "the AI base URL is not a valid URL: %s" % raw
+    if parts.scheme.lower() not in ("http", "https"):
+        return False, "the AI base URL must be http:// or https://"
+    if parts.username or parts.password:
+        return False, "credentials in the URL are not allowed"
+    if parts.query or parts.fragment:
+        return False, "the base URL must not carry a query or a fragment"
+    host = (parts.hostname or "").lower()
+    if host not in AI_HOSTS:
+        return False, "the AI endpoint must be on localhost (127.0.0.1, localhost or ::1), got '%s'" % (parts.hostname or "")
+    try:
+        port = parts.port
+    except ValueError:
+        return False, "the AI base URL has an invalid port"
+    if port is not None and not (1 <= port <= 65535):
+        return False, "the AI base URL has an out-of-range port"
+    return True, ""
+
+
+def parse_ai_answer(text):
+    """Extract {status, comment} from the model answer. -> dict or None.
+
+    The model is asked to answer with strict JSON; we tolerate markdown fences and
+    prose around the object, but never accept a status that is not in the alias map."""
+    text = (text or "").strip()
+    fence = re.search(r"```(?:json)?\s*(.+?)```", text, re.S | re.I)
+    if fence:
+        text = fence.group(1).strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        obj = json.loads(text[start:end + 1])
+    except ValueError:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    status = str(obj.get("status", "")).strip().lower().replace("-", "_").replace(" ", "_")
+    alias = {
+        "real": "real_threat", "threat": "real_threat", "real_threat": "real_threat",
+        "malicious": "real_threat", "true": "real_threat", "yes": "real_threat",
+        "false": "false_positive", "fp": "false_positive", "false_positive": "false_positive",
+        "benign": "false_positive", "safe": "false_positive", "no": "false_positive",
+        "uncertain": "uncertain", "unknown": "uncertain", "unsure": "uncertain",
+        "unclear": "uncertain", "maybe": "uncertain",
+    }
+    status = alias.get(status)
+    if not status:
+        return None
+    comment = str(obj.get("comment", "")).strip()
+    return {"status": status, "comment": comment[:AI_COMMENT_MAX]}
+
+
+def read_file_context(root, rel, lines, context_lines=AI_CONTEXT_LINES, start_bytes=AI_START_BYTES):
+    """Read a bounded context around the finding lines. -> (start, context).
+
+    Never returns more than AI_PROMPT_FILE_BYTES; reads only what is needed."""
+    path = root / rel
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return "", ""
+    if len(raw) > AI_PROMPT_FILE_BYTES:
+        raw = raw[:AI_PROMPT_FILE_BYTES]
+    text = raw.decode("utf-8", "replace")
+    lines_list = text.splitlines()
+    start = text[:start_bytes]
+    wanted = set()
+    for ln in lines:
+        try:
+            n = int(ln or 0)
+        except (TypeError, ValueError):
+            continue
+        for k in range(max(1, n - context_lines), min(len(lines_list), n + context_lines) + 1):
+            wanted.add(k)
+    if not wanted:
+        return start, ""
+    out, prev = [], None
+    for k in sorted(wanted):
+        if prev is not None and k - prev > 2:
+            out.append("    ...")
+        out.append("%6d | %s" % (k, lines_list[k - 1]))
+        prev = k
+    context = "\n".join(out)
+    if len(context) > AI_MAX_CONTENT:
+        context = context[:AI_MAX_CONTENT]
+    return start, context
+
+
+def build_ai_prompt(payload):
+    """The prompt for one file. payload: rel, level, score, size, date, findings,
+    context, start. -> str. Only snippets + metadata + a bounded context of the
+    file are sent - never the whole file."""
+    lines = [
+        "You are a security analyst reviewing suspicious code found by a static scanner.",
+        "Answer with STRICT JSON only, no markdown fences:",
+        '{"status": "real_threat" | "false_positive" | "uncertain", "comment": "<reason, English, <= 400 chars>"}',
+        "",
+        "File: %s" % payload["rel"],
+        "Scanner verdict: %s | Score: %s | Size: %s | Modified: %s" % (
+            payload["level"], payload["score"], payload["size"], payload["date"]),
+        "",
+        "Findings (most important first):",
+    ]
+    for f in payload["findings"]:
+        lines.append("  - line %s: %s (severity %s, score %s)" % (
+            f.get("line", ""), f.get("signature", ""), f.get("severity", ""), f.get("score", "")))
+        snip = (f.get("snippet") or "").strip()
+        if snip:
+            lines.append("    snippet: %s" % snip[:600].replace("\n", " ").replace("\r", " "))
+    if payload.get("context"):
+        lines += ["", "Context around the findings (line numbers):", payload["context"]]
+    if payload.get("start"):
+        lines += ["", "The start of the file:", payload["start"][:AI_START_BYTES]]
+    lines += [
+        "",
+        "Decide: is this file a real malicious threat, or a false positive (known-safe content that looks risky, e.g. a plugin header or a comment) — or uncertain?",
+        "Base your answer ONLY on the evidence above. If the evidence is insufficient, answer 'uncertain'.",
+    ]
+    return "\n".join(lines)
+
+
+def build_ai_signature_prompt(payload):
+    """The prompt for one real-threat file: ask for ONE scanner-signature proposal.
+
+    Same discipline as the review prompt: metadata + bounded findings/context only -
+    never the whole file. The pattern is validated again before it may be written."""
+    lines = [
+        "You are a security analyst hardening a static scanner.",
+        "Answer with STRICT JSON only, no markdown fences:",
+        '{"propose": true | false, "label": "<short label>", "pattern": "<regex>", "severity": "critical" | "obfuscated" | "warning", "kinds": "<space separated kinds>", "weight": <int 1-30, optional>, "reason": "<<= 400 chars, evidence based>"}',
+        "",
+        "File: %s" % payload["rel"],
+        "Scanner verdict: %s | Score: %s | Size: %s | Modified: %s" % (
+            payload["level"], payload["score"], payload["size"], payload["date"]),
+        "",
+        "Findings (most important first):",
+    ]
+    for f in payload["findings"]:
+        lines.append("  - line %s: %s (severity %s, score %s)" % (
+            f.get("line", ""), f.get("signature", ""), f.get("severity", ""), f.get("score", "")))
+        snip = (f.get("snippet") or "").strip()
+        if snip:
+            lines.append("    snippet: %s" % snip[:600].replace("\n", " ").replace("\r", " "))
+    if payload.get("context"):
+        lines += ["", "Context around the findings (line numbers):", payload["context"]]
+    if payload.get("start"):
+        lines += ["", "The start of the file:", payload["start"][:AI_START_BYTES]]
+    lines += [
+        "",
+        "Propose ONE additional scanner signature that would flag the malicious code in THIS file.",
+        "The pattern must be a valid regular expression (Python-style, matched against the raw file text)",
+        "that matches the malicious code and NOT the benign content of this file.",
+        "If the evidence is insufficient, or the pattern cannot be made safe, answer propose=false with a reason.",
+        "kinds: one or more of: php, js, html, htaccess, ini, text (space separated).",
+    ]
+    return "\n".join(lines)
+
+
+def _validate_signature_fields(label, pattern, severity, kinds, weight):
+    """Validate a signature proposal. Shared by the AI answer parser and the apply endpoint.
+
+    -> normalized dict (kinds as a space-separated string, weight as int or None).
+    Raises ValueError with a short reason on failure."""
+    label = str(label or "").strip()
+    if len(label) < 2 or len(label) > AI_SIGNATURE_LABEL_MAX:
+        raise ValueError("label must be 2-%d chars" % AI_SIGNATURE_LABEL_MAX)
+    pattern = str(pattern or "").strip()
+    if len(pattern) < 2 or len(pattern) > 400:
+        raise ValueError("pattern must be 2-400 chars")
+    try:
+        rx = re.compile(pattern)
+    except re.error as exc:
+        raise ValueError("pattern is not a valid regex: %s" % exc)
+    for probe in ("", " "):
+        if rx.search(probe):
+            raise ValueError("pattern matches an empty or whitespace-only string - it would fire on every file")
+    severity = str(severity or "").strip().lower().strip("[]")
+    if severity == "obs":
+        severity = "obfuscated"
+    if severity not in USER_SIG_SEVERITIES:
+        raise ValueError("severity must be one of critical/obfuscated/warning")
+    if isinstance(kinds, (list, tuple)):
+        kinds = [str(k).strip().lower() for k in kinds]
+    else:
+        kinds = [k.strip().lower() for k in str(kinds or "").split()]
+    kinds = [k for k in kinds if k]
+    if not kinds:
+        raise ValueError("kinds are missing")
+    bad = [k for k in kinds if k not in USER_SIG_KINDS]
+    if bad:
+        raise ValueError("unknown kinds: %s (allowed: %s)" % (", ".join(bad), ", ".join(USER_SIG_KINDS)))
+    if weight is None or str(weight).strip() == "":
+        weight = None
+    else:
+        try:
+            weight = int(weight)
+        except (TypeError, ValueError):
+            raise ValueError("weight must be an integer")
+        if not 1 <= weight <= 30:
+            raise ValueError("weight %d is out of the 1-30 range" % weight)
+    return {"label": label, "pattern": pattern, "severity": severity,
+            "kinds": " ".join(dict.fromkeys(kinds)), "weight": weight}
+
+
+def parse_ai_signature_answer(text):
+    """Extract one signature proposal from the model answer.
+
+    -> {"propose": True, "label": ..., "pattern": ..., "severity": ..., "kinds": [...],
+        "weight": int|None, "reason": ...}
+       {"propose": False, "reason": ...}   (the model declined or the proposal is invalid)
+       None                                 (unreadable answer)"""
+    text = (text or "").strip()
+    fence = re.search(r"```(?:json)?\s*(.+?)```", text, re.S | re.I)
+    if fence:
+        text = fence.group(1).strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        obj = json.loads(text[start:end + 1])
+    except ValueError:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    reason = str(obj.get("reason", "")).strip()[:AI_SIGNATURE_REASON_MAX]
+    propose_raw = obj.get("propose", True)
+    if isinstance(propose_raw, str):
+        propose = propose_raw.strip().lower() not in ("false", "no", "0", "n")
+    else:
+        propose = bool(propose_raw)
+    if not propose:
+        return {"propose": False, "reason": reason}
+    try:
+        v = _validate_signature_fields(obj.get("label"), obj.get("pattern"), obj.get("severity"),
+                                        obj.get("kinds"), obj.get("weight"))
+    except ValueError as exc:
+        return {"propose": False, "reason": "invalid proposal: %s" % exc}
+    kinds = v["kinds"].split(" ")
+    return {"propose": True, "label": v["label"], "pattern": v["pattern"], "severity": v["severity"],
+            "kinds": kinds, "weight": v["weight"], "reason": reason}
+
+
+def validate_signature(entry, reason_max=AI_SIGNATURE_REASON_MAX):
+    """Validate one signature coming from the frontend / the library. -> normalized dict
+    (label, pattern, severity, kinds [space-separated], weight, reason, created, flags).
+    Raises ValueError with a short reason on failure."""
+    if not isinstance(entry, dict):
+        raise ValueError("entry is not an object")
+    v = _validate_signature_fields(entry.get("label"), entry.get("pattern"), entry.get("severity"),
+                                   entry.get("kinds"), entry.get("weight"))
+    reason = str(entry.get("reason", "")).strip()[:reason_max]
+    v["reason"] = reason
+    v["created"] = datetime.now().strftime("%Y-%m-%d")
+    v["flags"] = "i"     # case-insensitive by default (the scanner's own default)
+    return v
+
+
+def ai_http_post(url, body, timeout=AI_TIMEOUT):
+    req = Request(url, data=json.dumps(body).encode("utf-8"),
+                  headers={"Content-Type": "application/json", "Accept": "application/json"},
+                  method="POST")
+    with urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8", "replace"))
+
+
+def ai_http_get(url, timeout=AI_TIMEOUT):
+    req = Request(url, headers={"Accept": "application/json"})
+    with urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8", "replace"))
+
 
 # The GUI path fields and their kind: "file" must exist, "dir" must be a folder,
 # "save" is a report destination (its folder must exist and be writable).
@@ -221,7 +534,13 @@ class App(object):
         self.report_files, self.scanned_site, self.last_stats = {}, None, None
         self.notice, self.notice_seq = None, 0
         self.cleaned, self.stripped, self.replaced, self.clean_summary = [], [], [], None
+        self.engines = []          # downloadable engines detected on the site: [{"name","version"}]
+        self.baseline_view = {"dir": "", "version": None, "joomla": None, "match": False}
+        threading.Thread(target=self._refresh_engines, daemon=True).start()
         self.shutdown_cb = None
+        self.ai_results = {}                    # rel -> {status, comment}, loaded from the CSV below
+        self._active_ai_model = ''                # resolved once per review job, then used for every file
+        self._ai_loaded_model_cache = None           # the loaded model, resolved once per process
         self.load_findings()                  # show the previous report right away, if there is one
 
     # ------------------------------------------------------------ settings
@@ -350,6 +669,7 @@ class App(object):
     def load_findings(self):
         with self.lock:
             self.findings, self.hidden_done = [], 0
+            self.ai_results = {}
             path, loader = self.report_path("csv"), self._read_csv
             if path is None:
                 path, loader = self.report_path("json"), self._read_json
@@ -370,10 +690,18 @@ class App(object):
                             or mark == "replaced":
                         self.hidden_done += 1
                         continue
+                    # marked false-positive in the AI review and removed from the list: still in the CSV
+                    handle = (row.get("AI Handled") or "").strip().lower()
+                    if handle == "false_positive":
+                        self.hidden_done += 1
+                        continue
                     level = (row.get("Verdict") or "").upper().strip()
                     row["_level"] = level if level in LEVEL_ORDER else "LOW"
                     row["_id"] = self.next_id
                     self.next_id += 1
+                    verdict = clean_cell(row.get("AI Verdict", "")).strip().lower()
+                    if verdict in ("real_threat", "false_positive", "uncertain", "error"):
+                        self.ai_results[rel] = {"status": verdict, "comment": str(row.get("AI Comment", ""))[:AI_COMMENT_MAX]}
                     self.findings.append(row)
             self.findings_version += 1
 
@@ -397,29 +725,49 @@ class App(object):
     def findings_list(self, params):
         level = params.get("level", "All")
         query = params.get("q", "").casefold().strip()
+        ai_filter = params.get("ai", "all").casefold().strip()
         sort, desc = params.get("sort", ""), params.get("desc", "0") == "1"
         try:
             limit = max(1, min(int(params.get("limit", MAX_TABLE_ROWS)), MAX_TABLE_ROWS))
         except ValueError:
             limit = MAX_TABLE_ROWS
         with self.lock:
-            rows = self.findings
-            if sort in ("level", "score", "file", "line", "size", "date", "delete", "signature"):
-                rows = sorted(rows, key=lambda r: self._sort_key(r, sort), reverse=desc)
-            out, matched = [], 0
-            for r in rows:
-                if level != "All" and r["_level"] != level:
-                    continue
+            def keep(r):
                 if query and query not in (r.get("File", "") + " " + r.get("Signature", "")).casefold():
+                    return False
+                ai = self.ai_results.get(clean_cell(r.get("File", "")))
+                status = ai.get("status") if ai else None
+                if ai_filter == "hide_fp" and status == "false_positive":
+                    return False
+                if ai_filter in ("real", "malicious") and status != "real_threat":
+                    return False
+                if ai_filter == "clean" and status != "false_positive":
+                    return False
+                if ai_filter == "not_reviewed" and status:
+                    return False
+                return True
+            base = [r for r in self.findings if keep(r)]
+            counts = {"ALL": len(base), "HIGH": 0, "MEDIUM": 0, "LOW": 0}
+            for r in base:
+                if r["_level"] in counts:
+                    counts[r["_level"]] += 1
+            if sort in ("level", "score", "file", "line", "size", "date", "delete", "signature"):
+                base = sorted(base, key=lambda r: self._sort_key(r, sort), reverse=desc)
+            out, matched = [], 0
+            for r in base:
+                if level != "All" and r["_level"] != level:
                     continue
                 matched += 1
                 if len(out) < limit:
+                    ai = self.ai_results.get(clean_cell(r.get("File", "")))
                     out.append({"id": r["_id"], "level": r["_level"], "score": r.get("Score", ""),
                                 "file": r.get("File", ""), "line": r.get("Line", ""),
                                 "size": fmt_size(r.get("Size", "")), "date": r.get("Modified", ""),
-                                "delete": r.get("Delete", ""), "signature": r.get("Signature", "")})
+                                "delete": r.get("Delete", ""), "signature": r.get("Signature", ""),
+                                "ai": ai})
             return {"total": len(self.findings), "matched": matched, "shown": len(out), "limit": limit,
-                    "hidden_done": self.hidden_done, "version": self.findings_version, "rows": out}
+                    "hidden_done": self.hidden_done, "version": self.findings_version,
+                    "counts": counts, "rows": out}
 
     def finding_detail(self, fid):
         with self.lock:
@@ -429,7 +777,8 @@ class App(object):
                             "line": r.get("Line", ""), "size": fmt_size(r.get("Size", "")),
                             "date": r.get("Modified", ""), "signature": r.get("Signature", ""),
                             "severity": r.get("Severity", ""), "sha256": r.get("SHA-256", ""),
-                            "snippet": r.get("Snippet", "")}
+                            "snippet": r.get("Snippet", ""),
+                            "ai": self.ai_results.get(clean_cell(r.get("File", "")))}
         raise ApiError("The row no longer exists.", 404)
 
     def _rows_by_ids(self, ids):
@@ -618,7 +967,7 @@ class App(object):
             raise ApiError("The field '%s' cannot be less than %s." % (name, minimum))
         return s
 
-    def build_scan_command(self):
+    def build_scan_command(self, allow_baseline=True):
         scanner = Path(self.s("scanner_path")).expanduser()
         site = Path(self.s("site_dir")).expanduser()
         if not scanner.is_file():
@@ -648,8 +997,17 @@ class App(object):
         add("--since", since)
         add("--exclude-ext", self.s("exclude_ext"))
         add("--exclude-dir", self.s("exclude_dir"))
-        add("--baseline-dir", self.s("baseline_dir"))
+        if allow_baseline:
+            add("--baseline-dir", self.s("baseline_dir"))
         add("--whitelist", self.s("whitelist_path"))
+        # the AI-confirmed signature library: the scanner refuses to run with a missing file,
+        # so the flag is only passed when the file exists and is not empty
+        try:
+            user_sigs_raw = USER_SIGS_PATH.read_text(encoding="utf-8", errors="ignore").strip()
+        except OSError:
+            user_sigs_raw = ""
+        if user_sigs_raw:
+            cmd.extend(["--user-signatures", str(USER_SIGS_PATH)])
         outputs = [("--xlsx", self.s("xlsx_path")), ("--json", self.s("json_path"))]
         if self.s("no_csv"):
             cmd.append("--no-csv")
@@ -728,18 +1086,22 @@ class App(object):
                              "Update scan_backdoors.py to %s or newer.\n\n" % MIN_SCANNER)
         threading.Thread(target=self._run_job, args=(cmd,), daemon=True).start()
 
-    def start_scan(self):
+    def start_scan(self, no_baseline=False):
         if self._refuse_bad_settings():
             return
-        cmd, markers = self.build_scan_command()
+        cmd, markers = self.build_scan_command(allow_baseline=not no_baseline)
         with self.lock:
             if self.job is not None:
                 raise ApiError("Another job is already running.", 409)
             self.report_files, self.last_stats = {}, None
+            self.ai_results = {}
             self.scanned_site = str(Path(self.s("site_dir")).expanduser())
             self.findings, self.hidden_done = [], 0
             self.findings_version += 1
             self.status = "Scan in progress…"
+            if no_baseline:
+                self.log_add("Note: the scan runs WITHOUT the clean Joomla baseline - core files are judged "
+                             "by heuristics only (the baseline did not match the site version, or was skipped).\n")
             self._start_job("scan", cmd, markers)
 
     def start_clean_plan(self):
@@ -763,6 +1125,190 @@ class App(object):
     def clean_cancel(self):
         self.status = "Mass cleanup cancelled."
 
+    # ---------------------------------------------------------------- baseline
+    @staticmethod
+    def _joomla_version(root):
+        """The site's exact Joomla version from its own files (same sources the cleaner
+        uses: J4/5 libraries/src/Version.php, J3 libraries/cms/version/version.php)."""
+        root = Path(str(root or ""))
+        try:
+            t = (root / "libraries" / "src" / "Version.php").read_text(encoding="utf-8", errors="ignore")
+            parts = [re.search(r"%s_VERSION\s*=\s*(\d+)" % k, t) for k in ("MAJOR", "MINOR", "PATCH")]
+            if all(parts):
+                return ".".join(m.group(1) for m in parts)
+        except OSError:
+            pass
+        try:
+            t = (root / "libraries" / "cms" / "version" / "version.php").read_text(encoding="utf-8", errors="ignore")
+            rel = re.search(r"(?:const\s+)?\$?RELEASE\s*=\s*'([\d.]+)'", t)
+            dev = re.search(r"(?:const\s+)?\$?DEV_LEVEL\s*=\s*'(\d+)'", t)
+            if rel and dev:
+                return "%s.%s" % (rel.group(1), dev.group(1))
+        except OSError:
+            pass
+        return None
+
+    def baseline_detect(self):
+        """Report the exact Joomla version of the configured site (for the Fetch baseline button)."""
+        site_s = self.s("site_dir").strip()
+        if not site_s or not Path(site_s).expanduser().is_dir():
+            raise ApiError("Select an existing site folder on the Settings tab first.")
+        v = self._joomla_version(site_s)
+        if not v or not re.match(r"^\d+\.\d+\.\d+$", v):
+            raise ApiError("Could not detect the exact Joomla version (x.y.z) from the site's version files. "
+                           "Set the 'Clean Joomla folder' by hand, or run joomla_baseline.py <version> from the command line.")
+        return {"version": v}
+
+    def baseline_fetch(self, version=""):
+        """Start a job that downloads the official clean Joomla Full_Package (joomla_baseline.py,
+        GitHub releases, HTTPS). On success the baseline_dir setting is filled in automatically."""
+        v = str(version or "").strip()
+        if not v:
+            v = self.baseline_detect()["version"]
+        if not re.match(r"^\d+\.\d+\.\d+$", v):
+            raise ApiError("Bad Joomla version: %s" % v)
+        scanner = Path(self.s("scanner_path")).expanduser()
+        if not scanner.is_file():
+            raise ApiError("The scanner file scan_backdoors.py was not found.")
+        tool = scanner.resolve().parent / "joomla_baseline.py"
+        if not tool.is_file():
+            raise ApiError("joomla_baseline.py was not found next to the scanner.")
+        out = scanner.resolve().parent / "joomla-baselines"
+        folder = out / ("Joomla_" + v)
+        cmd = [python_exe(), "-u", str(tool), v, "--out", str(out)]
+        self._start_job("baseline", cmd)
+        with self.lock:
+            if self.job is not None:
+                self.job["text"] = "Fetching the clean Joomla %s baseline…" % v
+                self.job["baseline_folder"] = str(folder)
+                self.job["baseline_version"] = v
+        return {"ok": True, "version": v, "folder": str(folder)}
+
+    # ---------------------------------------------------------------- engines
+    ENGINE_SKIP_DIRS = {"files", "tmp", "cache", "logs", "media", "assets", "language", "languages",
+                        "models", "views", "controllers", "helpers", "tables", "scripts", "sql", "config"}
+    ENGINE_NAME_MAP = {"com_virtuemart": "VirtueMart", "com_akeeba": "Akeeba Backup",
+                       "com_admintools": "Admin Tools", "com_joomshop": "JoomShopping",
+                       "com_hikashop": "HikaShop", "com_phocadownload": "Phoca Download",
+                       "com_sppagebuilder": "SP Page Builder", "com_yootheme": "YOOtheme"}
+
+    @staticmethod
+    def _manifest_name_version(xf):
+        """(<name>, <version>) from a Joomla install manifest XML; version None when absent."""
+        try:
+            t = xf.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return None, None
+        if "<install" not in t and "<extension" not in t:
+            return None, None
+        m = re.search(r"<name>\s*([^<]{1,40}?)\s*</name>", t, re.I)
+        v = re.search(r"<version>\s*([0-9][^<\s]{0,24})\s*</version>", t, re.I)
+        return (m.group(1).strip() if m else None), (v.group(1) if v else None)
+
+    def _detect_engines(self):
+        """What the site is made of: the Joomla core version plus third-party extensions
+        that publish their version (install manifest <version>, or a VERSION define in
+        version.php - like VirtueMart). These are the originals one can download freely."""
+        out = []
+        site_s = self.s("site_dir").strip()
+        site = Path(site_s).expanduser() if site_s else None
+        if not site or not site.is_dir():
+            return out
+        jv = self._joomla_version(site)
+        if jv:
+            out.append({"name": "Joomla", "version": jv})
+        seen = set((e["name"].lower(), e["version"]) for e in out)
+        for sub in ("administrator/components", "components", "modules"):
+            base = site / sub
+            if not base.is_dir():
+                continue
+            try:
+                kids = sorted(base.iterdir())
+            except OSError:
+                continue
+            for d in kids:
+                if not d.is_dir() or d.name.lower() in self.ENGINE_SKIP_DIRS:
+                    continue
+                name = ver = None
+                try:
+                    manifests = sorted(d.glob("*.xml"))
+                except OSError:
+                    manifests = []
+                for xf in manifests[:4]:
+                    nm, vv = self._manifest_name_version(xf)
+                    if vv:
+                        name, ver = nm or d.name, vv
+                        break
+                if ver is None and d.name.lower().startswith("com_"):
+                    try:
+                        t = (d / "version.php").read_text(encoding="utf-8", errors="ignore")
+                        m = re.search(r"define\s*\(\s*['\"][A-Z0-9_]*VERSION['\"]\s*,\s*['\"]([0-9][^'\"]*)['\"]", t)
+                        if m:
+                            name, ver = d.name, m.group(1)
+                    except OSError:
+                        pass
+                if not ver:
+                    continue
+                if jv and ver == jv:
+                    continue          # a bundled core extension, not a separate downloadable engine
+                nm = self.ENGINE_NAME_MAP.get((name or d.name).lower(), name or d.name)
+                key = (nm.lower(), ver)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append({"name": nm, "version": ver})
+                if len(out) >= 12:
+                    return out
+        return out
+
+    def _refresh_engines(self):
+        try:
+            eng = self._detect_engines()
+        except Exception:
+            eng = []
+        with self.lock:
+            self.engines = eng
+        self._refresh_baseline_view(eng)
+
+    def _refresh_baseline_view(self, eng=None):
+        """What the Engines tab shows for the 'original loaded' mark: the Clean Joomla
+        folder, the Joomla version it holds, and whether it matches the site's core."""
+        bdir = self.s("baseline_dir").strip()
+        bv = self.baseline_version()
+        if eng is None:
+            with self.lock:
+                eng = self.engines
+        jv = next((e["version"] for e in eng if e["name"] == "Joomla"), None)
+        with self.lock:
+            self.baseline_view = {"dir": bdir, "version": bv, "joomla": jv,
+                                  "match": bool(jv and bv and bv == jv)}
+
+    def baseline_version(self):
+        b = self.s("baseline_dir").strip()
+        if not b:
+            return None
+        p = Path(b).expanduser()
+        return self._joomla_version(p) if p.is_dir() else None
+
+    def preflight(self):
+        """Before a scan: does the loaded clean-Joomla baseline match the detected core version?"""
+        eng = self._detect_engines()
+        with self.lock:
+            self.engines = eng
+        self._refresh_baseline_view(eng)
+        jv = next((e["version"] for e in eng if e["name"] == "Joomla"), None)
+        bdir = self.s("baseline_dir").strip()
+        bv = self.baseline_version()
+        if not jv:
+            mode = "no_engine"
+        elif not bdir:
+            mode = "no_baseline"
+        elif bv == jv:
+            mode = "ok"
+        else:
+            mode = "mismatch"
+        return {"mode": mode, "joomla": jv, "baseline": {"dir": bdir, "version": bv}, "engines": eng}
+
     def stop_job(self):
         with self.lock:
             job = self.job
@@ -772,6 +1318,486 @@ class App(object):
             self.status = "Stopping…"
             proc = job["proc"]
         kill_tree(proc)
+
+    # ---------------------------------------------------------------- AI review
+    # The AI review is an in-process job (no subprocess): it reviews the suspicious
+    # files one at a time against a localhost model and stores the verdicts in the
+    # report CSV (columns "AI Verdict" / "AI Comment") and in self.ai_results.
+    def ai_unique_files(self):
+        """Unique files from the current findings, highest priority first.
+        -> [(rel, best_row, rows_sorted), ...]"""
+        def score_of(r):
+            try:
+                return float(r.get("Score") or -1)
+            except ValueError:
+                return -1.0
+        with self.lock:
+            by_file = {}
+            for r in self.findings:
+                rel = clean_cell(r.get("File", ""))
+                if rel:
+                    by_file.setdefault(rel, []).append(r)
+            out = []
+            for rel, rows in by_file.items():
+                rows = sorted(rows, key=lambda r: (LEVEL_ORDER.get(r.get("_level"), 3), -score_of(r)))
+                out.append((rel, rows[0], rows))
+            out.sort(key=lambda t: (LEVEL_ORDER.get(t[1].get("_level"), 3), -score_of(t[1])))
+            return out
+
+    def start_ai_review(self, dry_run=False, files=None):
+        """Prepare (and, unless dry_run, start) the AI review. -> {"ok": True,
+        "files": n, "endpoint": url, "model": model}. When `files` (a list of
+        relative paths from the table selection) is given, only those files are
+        reviewed - all of them, without the AI_MAX_FILES cap."""
+        if not self.s("ai_enabled"):
+            raise ApiError("AI review is disabled in the settings. Enable it on the Settings tab first.")
+        ok, reason = validate_ai_endpoint(self.s("ai_base_url"))
+        if not ok:
+            raise ApiError("The AI endpoint is not valid: %s" % reason)
+        if not str(self.site_root() or "").strip():
+            raise ApiError("The site folder is not set - choose it on the Settings tab first.")
+        plan = self.ai_unique_files()
+        wanted = [clean_cell(f) for f in files if clean_cell(f)] if isinstance(files, (list, tuple)) else None
+        if wanted:
+            want = set(w.replace("\\", "/") for w in wanted)
+            plan = [t for t in plan if t[0].replace("\\", "/") in want]
+            if not plan:
+                raise ApiError("The selected files are not in the current report any more - run a new scan and try again.")
+            self.log_add("\nNote: reviewing the %d file(s) selected in the table (selected files are not capped).\n" % len(plan))
+        elif not plan:
+            raise ApiError("The current report has no suspicious files to review.")
+        elif len(plan) > AI_MAX_FILES:
+            self.log_add("\nNote: %d files are in the report; only the first %d (most critical) will be reviewed.\n" % (len(plan), AI_MAX_FILES))
+            plan = plan[:AI_MAX_FILES]
+        endpoint = self.ai_endpoint()
+        if dry_run:
+            return {"ok": True, "files": len(plan), "endpoint": endpoint, "model": str(self.s("ai_model") or "")}
+        model = str(self.s("ai_model") or "").strip()
+        if not model:
+            model = self.ai_loaded_model()
+        if not model:
+            self.log_add("\nNote: no AI model configured and the gateway did not report a loaded model - requests will be sent without one.\n")
+        self._active_ai_model = model
+        with self.lock:
+            if self.job is not None:
+                raise ApiError("Another job is already running.", 409)
+            self.ai_results = {}
+            self.findings_version += 1
+            self.job = {"kind": "ai-review", "proc": None, "t0": time.time(), "text": "Starting…",
+                        "indeterminate": False, "done": 0, "total": len(plan), "stopped": False,
+                        "got_done": False, "markers": False, "report_error": False,
+                        "current": None, "times": []}
+            self.idle_text = ""
+            self.status = "AI review in progress…"
+        self.log_add("\n" + "=" * 76 + "\nAI review: %d unique file(s), endpoint %s, model %s\n\n" % (len(plan), endpoint, model))
+        threading.Thread(target=self._run_ai_review, args=(plan,), daemon=True).start()
+        return {"ok": True, "files": len(plan), "endpoint": endpoint, "model": model}
+
+    def ai_endpoint(self):
+        base = str(self.s("ai_base_url") or "").strip().rstrip("/")
+        if base.lower().endswith("/chat/completions"):
+            return base
+        return base + "/chat/completions"
+
+    def ai_loaded_model(self):
+        """The model the gateway has loaded, used when ai_model is not configured.
+
+        Queries the gateway's /v1/models endpoint (localhost, validated already).
+        One cached request; -> '' on any failure. Never sends file contents."""
+        cached = getattr(self, "_ai_loaded_model_cache", None)
+        if cached is not None:
+            return cached
+        base = str(self.s("ai_base_url") or "").strip().rstrip("/")
+        if base.lower().endswith("/chat/completions"):
+            base = base[:-len("/chat/completions")]
+        model = ""
+        try:
+            data = ai_http_get(base + "/models")
+            models = data.get("data") if isinstance(data, dict) else None
+            if isinstance(models, list):
+                for m in models:
+                    if isinstance(m, dict) and (m.get("status") or {}).get("value") == "loaded" and m.get("id"):
+                        model = str(m.get("id"))
+                        break
+                if not model and models and isinstance(models[0], dict):
+                    model = str(models[0].get("id") or "")
+        except Exception:
+            model = ""
+        self._ai_loaded_model_cache = model
+        return model
+
+    def _file_ai_payload(self, rel, best, rows):
+        """The bounded payload sent to the model for one file (review or signature proposal)."""
+        root = Path(self.site_root()).expanduser()
+        findings = []
+        for r in rows[:AI_MAX_FINDINGS]:
+            findings.append({"line": r.get("Line", ""), "signature": r.get("Signature", ""),
+                             "severity": r.get("Severity", ""), "score": r.get("Score", ""),
+                             "snippet": r.get("Snippet", "")})
+        lines = [f["line"] for f in findings]
+        try:
+            start, context = read_file_context(root, rel, lines)
+        except Exception:
+            start, context = "", ""
+        return {"rel": rel, "level": best.get("_level", "LOW"), "score": best.get("Score", ""),
+                "size": fmt_size(best.get("Size", "")), "date": best.get("Modified", ""),
+                "findings": findings, "context": context, "start": start}
+
+    def _ask_ai_file(self, rel, best, rows):
+        payload = self._file_ai_payload(rel, best, rows)
+        prompt = build_ai_prompt(payload)
+        model = (self._active_ai_model or str(self.s("ai_model") or "")).strip()
+        body = {"messages": [{"role": "user", "content": prompt}], "temperature": 0.1, "max_tokens": 800}
+        if model:
+            body["model"] = model
+        data = ai_http_post(self.ai_endpoint(), body)
+        content = ""
+        try:
+            content = data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError):
+            content = ""
+        verdict = parse_ai_answer(content)
+        if verdict is None:
+            return {"status": "error", "comment": "The model returned an unreadable answer: %s" % (content or "(empty)")[:AI_COMMENT_MAX]}
+        return verdict
+
+    def _run_ai_review(self, plan):
+        processed, stopped = 0, False
+        for i, (rel, best, rows) in enumerate(plan):
+            with self.lock:
+                job = self.job
+                if job is None:
+                    return
+                if job["stopped"]:
+                    stopped = True
+                    break
+                job["current"] = rel
+            self.log_add("\n[%d/%d] %s\n" % (i + 1, len(plan), rel))
+            t_start = time.time()
+            try:
+                verdict = self._ask_ai_file(rel, best, rows)
+            except Exception as exc:
+                verdict = {"status": "error", "comment": str(exc)[:AI_COMMENT_MAX]}
+            elapsed_file = time.time() - t_start
+            with self.lock:
+                self.ai_results[rel] = verdict
+                job = self.job
+                if job is not None:
+                    job["done"] = i + 1
+                    job["current"] = ""
+                    times = job.setdefault("times", [])
+                    times.append(elapsed_file)
+                    del times[:-5]  # keep the last few durations for the ETA estimate
+                self.findings_version += 1
+            processed = i + 1
+            try:
+                self.mark_ai_in_csv({rel: verdict})
+            except Exception as exc:
+                self.log_add("\n[WARNING] Could not write the AI verdict to the CSV: %s\n" % exc)
+        self._finish_ai_review(stopped, processed, len(plan))
+
+    def _finish_ai_review(self, stopped, processed, total):
+        with self.lock:
+            self.job = None
+            ai = dict(self.ai_results)
+        counts = {}
+        for v in ai.values():
+            st = v.get("status", "error")
+            counts[st] = counts.get(st, 0) + 1
+        parts = ["%d of %d file(s) reviewed" % (processed, total)]
+        for st, label in (("real_threat", "real threats"), ("false_positive", "false positives"),
+                          ("uncertain", "uncertain"), ("error", "errors")):
+            if counts.get(st):
+                parts.append("%s: %d" % (label, counts[st]))
+        msg = "AI review: " + ", ".join(parts)
+        if stopped:
+            msg += " - stopped by the user"
+        self.status = msg
+        self.log_add("\n" + msg + "\n")
+        self.findings_version += 1
+        self.notify("info", "AI review", msg, ai_real=counts.get("real_threat", 0),
+                    ai_fp=counts.get("false_positive", 0), ai_stopped=bool(stopped))
+
+    def mark_ai_in_csv(self, results):
+        """Write the AI verdicts into the CSV (columns "AI Verdict" / "AI Comment").
+        Mirrors mark_deleted_in_csv: read, append missing columns, write atomically."""
+        path = Path(self.report_files["csv"]) if self.report_files.get("csv") else self.report_path("csv")
+        if not path or not path.is_file():
+            return None
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            with path.open("r", encoding="utf-8-sig", newline="") as f:
+                reader = csv.DictReader(f)
+                fields = list(reader.fieldnames or [])
+                if "File" not in fields:
+                    return None
+                rows = list(reader)
+            for col in ("AI Verdict", "AI Comment", "AI Handled"):
+                if col not in fields:
+                    fields.append(col)
+            for row in rows:
+                rel = clean_cell(row.get("File", ""))
+                v = results.get(rel)
+                if v is None:
+                    continue
+                status = str(v.get("status", ""))[:64]
+                row["AI Verdict"] = status
+                row["AI Comment"] = str(v.get("comment", ""))[:AI_COMMENT_MAX]
+                # the "handled" flag survives a re-review only while the verdict stays false_positive
+                if status != "false_positive":
+                    row["AI Handled"] = ""
+            with tmp.open("w", encoding="utf-8-sig", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=fields)
+                w.writeheader()
+                w.writerows(rows)
+            os.replace(str(tmp), str(path))
+            return None
+        except (OSError, csv.Error) as exc:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            return str(exc)
+
+    def _candidate_groups(self, ai, rows):
+        """One group per signature over the real-threat verdicts, with the evidence."""
+        real = [rel for rel, v in ai.items() if v.get("status") == "real_threat"]
+        by_rel = {}
+        for r in rows:
+            rel = clean_cell(r.get("File", ""))
+            if rel:
+                by_rel.setdefault(rel, []).append(r)
+        groups = {}
+        for rel in real:
+            comment = ai.get(rel, {}).get("comment", "")
+            for r in by_rel.get(rel, []):
+                sig = r.get("Signature", "") or "(unknown signature)"
+                g = groups.get(sig)
+                if g is None:
+                    g = {"signature": sig, "severity": r.get("Severity", ""), "score": r.get("Score", ""),
+                         "files": [], "examples": [], "count": 0}
+                    groups[sig] = g
+                g["count"] += 1
+                if len(g["files"]) < 8 and rel not in g["files"]:
+                    g["files"].append(rel)
+                if len(g["examples"]) < 3:
+                    g["examples"].append({"file": rel, "line": r.get("Line", ""),
+                                          "snippet": r.get("Snippet", ""), "ai_comment": comment})
+        return real, groups
+
+    def _ai_stats(self, ai, rows):
+        """The AI-review counters for the run bar (after the review completes)."""
+        counts = {}
+        for v in ai.values():
+            st = v.get("status", "error")
+            counts[st] = counts.get(st, 0) + 1
+        _, groups = self._candidate_groups(ai, rows)
+        return {"reviewed": len(ai),
+                "real_threat": counts.get("real_threat", 0),
+                "false_positive": counts.get("false_positive", 0),
+                "uncertain": counts.get("uncertain", 0),
+                "error": counts.get("error", 0),
+                "candidates": len(groups)}
+
+    def ai_candidates(self):
+        """Compose a list of candidates for the signature library from the
+        real-threat verdicts: one group per signature, with the evidence."""
+        with self.lock:
+            ai = dict(self.ai_results)
+            rows = list(self.findings)
+        real, groups = self._candidate_groups(ai, rows)
+        if not real:
+            raise ApiError("The AI review found no real threats.")
+        candidates = sorted(groups.values(), key=lambda g: (-g["count"], g["signature"]))
+        return {"candidates": candidates, "files": len(real)}
+
+    def ai_prepare_signatures(self):
+        """Ask the AI to propose one scanner signature per real-threat file.
+
+        Evidence-only and bounded (the same discipline as the review): no whole files,
+        no non-localhost hosts, and nothing is applied automatically.
+        -> {"ok": True, "proposals": [...], "files": n, "problems": [...]}"""
+        if not self.s("ai_enabled"):
+            raise ApiError("AI review is disabled in the settings. Enable it on the Settings tab first.")
+        ok, reason = validate_ai_endpoint(self.s("ai_base_url"))
+        if not ok:
+            raise ApiError("The AI endpoint is not valid: %s" % reason)
+        with self.lock:
+            real = [rel for rel, v in self.ai_results.items() if v.get("status") == "real_threat"]
+            rows_by_file = {}
+            for r in self.findings:
+                rel = clean_cell(r.get("File", ""))
+                if rel:
+                    rows_by_file.setdefault(rel, []).append(r)
+        if not real:
+            raise ApiError("The AI review found no real threats - there is nothing to build signatures from.")
+
+        def score_of(r):
+            try:
+                return float(r.get("Score") or -1)
+            except ValueError:
+                return -1.0
+
+        plan = []
+        for rel in real:
+            rows = rows_by_file.get(rel)
+            if not rows:
+                continue
+            rows = sorted(rows, key=lambda r: (LEVEL_ORDER.get(r.get("_level"), 3), -score_of(r)))
+            plan.append((rel, rows[0], rows))
+        plan.sort(key=lambda t: (LEVEL_ORDER.get(t[1].get("_level"), 3), -score_of(t[1])))
+        if len(plan) > AI_SIGNATURE_MAX_FILES:
+            self.log_add("\nNote: %d real-threat file(s); only the first %d (most critical) will be proposed.\n"
+                         % (len(plan), AI_SIGNATURE_MAX_FILES))
+            plan = plan[:AI_SIGNATURE_MAX_FILES]
+        proposals, problems = [], []
+        for rel, best, rows in plan:
+            try:
+                payload = self._file_ai_payload(rel, best, rows)
+                prompt = build_ai_signature_prompt(payload)
+                model = (self._active_ai_model or str(self.s("ai_model") or "")).strip()
+                body = {"messages": [{"role": "user", "content": prompt}], "temperature": 0.1,
+                        "max_tokens": AI_SIGNATURE_MAX_TOKENS}
+                if model:
+                    body["model"] = model
+                data = ai_http_post(self.ai_endpoint(), body)
+                content = ""
+                try:
+                    content = data["choices"][0]["message"]["content"]
+                except (KeyError, IndexError, TypeError):
+                    content = ""
+                parsed = parse_ai_signature_answer(content)
+            except Exception as exc:
+                problems.append({"file": rel, "reason": str(exc)[:200]})
+                continue
+            if parsed is None:
+                problems.append({"file": rel, "reason": "the model returned an unreadable answer"})
+                continue
+            if not parsed.get("propose"):
+                problems.append({"file": rel, "reason": parsed.get("reason") or "the model declined the proposal"})
+                continue
+            proposals.append({"label": parsed["label"], "pattern": parsed["pattern"],
+                              "severity": parsed["severity"], "kinds": " ".join(parsed["kinds"]),
+                              "weight": parsed.get("weight"), "reason": parsed.get("reason", ""),
+                              "file": rel, "line": rows[0].get("Line", "")})
+        return {"ok": True, "proposals": proposals, "files": len(plan), "problems": problems}
+
+    def apply_signatures(self, entries):
+        """Validate the signatures, merge them with the library, write it atomically.
+
+        Never writes a malformed entry. -> {"ok": True, "added": n, "replaced": n,
+        "problems": [...], "count": n, "path": path, "text": text}."""
+        if not isinstance(entries, list) or not entries:
+            raise ApiError("No signatures to add.")
+        existing = []
+        try:
+            data = json.loads(USER_SIGS_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                existing = data
+            elif isinstance(data, dict):
+                existing = data.get("signatures") or []
+        except Exception:
+            existing = []
+        valid = []
+        problems = []
+        for entry in entries:
+            try:
+                v = validate_signature(entry)
+            except (ValueError, TypeError) as exc:
+                problems.append({"label": str((entry or {}).get("label", ""))[:AI_SIGNATURE_LABEL_MAX]
+                                  if isinstance(entry, dict) else "",
+                                  "reason": str(exc)[:200]})
+                continue
+            valid.append(v)
+        # dedupe by label+pattern: a new version replaces the old one
+        merged = list(existing)
+        added = replaced = 0
+        for v in valid:
+            key = (v["label"].strip().lower(), v["pattern"].strip())
+            idx = None
+            for i, s in enumerate(merged):
+                if isinstance(s, dict) and (str(s.get("label", "")).strip().lower(),
+                                            str(s.get("pattern", "")).strip()) == key:
+                    idx = i
+                    break
+            if idx is not None:
+                old_created = merged[idx].get("created")
+                v["created"] = str(old_created or v["created"])
+                merged[idx] = v
+                replaced += 1
+            else:
+                merged.append(v)
+                added += 1
+        try:
+            tmp = USER_SIGS_PATH.with_name(USER_SIGS_PATH.name + ".tmp")
+            tmp.write_text(json.dumps(merged, ensure_ascii=False, indent=1), encoding="utf-8")
+            os.replace(str(tmp), str(USER_SIGS_PATH))
+        except OSError as exc:
+            raise ApiError("Could not write the signature library %s: %s" % (USER_SIGS_PATH, exc))
+        parts = []
+        if added:
+            parts.append("added %d" % added)
+        if replaced:
+            parts.append("updated %d" % replaced)
+        text = "Signature library updated (%s): %s" % (", ".join(parts) if parts else "nothing new", USER_SIGS_PATH)
+        if problems:
+            text += " - %d invalid entr%s skipped" % (len(problems), "y" if len(problems) == 1 else "ies")
+        self.log_add("\n" + text + "\n")
+        return {"ok": True, "added": added, "replaced": replaced, "problems": problems,
+                "count": len(merged), "path": str(USER_SIGS_PATH), "text": text}
+
+    def mark_false_positives_in_csv(self, rels):
+        """Write 'AI Handled'=false_positive for the given files (invisible to the scanner).
+        Mirrors mark_ai_in_csv: read, append missing column, write atomically."""
+        path = Path(self.report_files["csv"]) if self.report_files.get("csv") else self.report_path("csv")
+        if not path or not path.is_file():
+            return None
+        tmp = path.with_name(path.name + ".tmp")
+        want = set(rels)
+        try:
+            with path.open("r", encoding="utf-8-sig", newline="") as f:
+                reader = csv.DictReader(f)
+                fields = list(reader.fieldnames or [])
+                if "File" not in fields:
+                    return None
+                rows = list(reader)
+            for col in ("AI Handled",):
+                if col not in fields:
+                    fields.append(col)
+            for row in rows:
+                if clean_cell(row.get("File", "")) in want:
+                    row["AI Handled"] = "false_positive"
+            with tmp.open("w", encoding="utf-8-sig", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=fields)
+                w.writeheader()
+                w.writerows(rows)
+            os.replace(str(tmp), str(path))
+            return None
+        except (OSError, csv.Error) as exc:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            return str(exc)
+
+    def remove_false_positives(self):
+        """Hide every row whose AI verdict is false_positive (persisted in the CSV as
+        'AI Handled'=false_positive - the rows stay in the file). -> {"ok", "count", "text"}."""
+        with self.lock:
+            false_positives = {rel for rel, v in self.ai_results.items() if v.get("status") == "false_positive"}
+            count = sum(1 for r in self.findings
+                        if clean_cell(r.get("File", "")) in false_positives)
+        if not false_positives:
+            raise ApiError("The AI review found no false positives to remove.")
+        err = self.mark_false_positives_in_csv(false_positives)
+        with self.lock:
+            self.status = "False positives removed from the list"
+            self.log_add("\n%d false-positive row(s) removed from the list (they stay in the CSV).\n" % count)
+        self.load_findings()
+        text = "Removed %d false-positive row(s) from the list. The rows stay in the CSV." % count
+        if err:
+            text += " (CSV could not be updated: %s)" % err
+        return {"ok": True, "count": count, "text": text}
 
     def _run_job(self, cmd):
         env = os.environ.copy()
@@ -866,6 +1892,8 @@ class App(object):
                 self._finish_scan(code, valid, stopped, report_error, elapsed)
             elif kind == "clean-plan":
                 self._finish_clean_plan(code, stopped)
+            elif kind == "baseline":
+                self._finish_baseline(code, stopped, job)
             else:
                 self._finish_clean_apply(code, stopped)
 
@@ -939,6 +1967,23 @@ class App(object):
         self.status = "Mass cleanup: waiting for your confirmation."
         self.notify("clean_plan", "Mass cleanup", text, permanent=bool(permanent))
 
+    def _finish_baseline(self, code, stopped, job):
+        if stopped:
+            self.status = "Baseline download stopped by the user."
+            return
+        folder_raw = job.get("baseline_folder") or ""
+        ver = job.get("baseline_version") or ""
+        if code != 0 or not folder_raw or not Path(folder_raw).is_dir():
+            self.status = "The baseline download finished with an error (code %s), see the log." % code
+            self.notify("error", "Baseline",
+                        "The clean Joomla baseline was not fetched. See the log for details.")
+            return
+        self.update_settings({"baseline_dir": folder_raw})
+        threading.Thread(target=self._refresh_engines, daemon=True).start()
+        msg = "Baseline ready: the clean Joomla %s folder was set automatically: %s" % (ver, folder_raw)
+        self.status = msg
+        self.log_add("\n" + msg + "\n")
+
     def _finish_clean_apply(self, code, stopped):
         summary = self.clean_summary or {}
         if stopped:
@@ -974,19 +2019,36 @@ class App(object):
                     pct = 100.0 * done / total if total else 100.0
                     elapsed = time.time() - job["t0"]
                     text = ("%s files: %s of %s (%.0f%%) · elapsed %s" % (
-                        "Processed" if job["kind"].startswith("clean") else "Scanned",
+                        "Reviewed" if job["kind"] == "ai-review" else ("Processed" if job["kind"].startswith("clean") else "Scanned"),
                         "{:,}".format(done).replace(",", " "), "{:,}".format(total).replace(",", " "), pct,
                         fmt_duration(elapsed)))
-                    if 0 < done < total and elapsed > 1:
-                        text += " · ~%s left" % fmt_duration((total - done) / (done / elapsed))
+                    cur = job.get("current")
+                    if cur:
+                        text += " · now: %s" % (cur if len(cur) <= 70 else "…" + cur[-69:])
+                    if 0 < done < total:
+                        if job["kind"] == "ai-review":
+                            recent = job.get("times") or []
+                            if recent:
+                                per_file = sum(recent) / len(recent)
+                            elif elapsed > 1:
+                                per_file = elapsed / done
+                            else:
+                                per_file = None
+                            if per_file:
+                                text += " · ~%s left" % fmt_duration(per_file * (total - done))
+                        elif elapsed > 1:
+                            text += " · ~%s left" % fmt_duration((total - done) / (done / elapsed))
                 job_view = {"kind": job["kind"], "indeterminate": job["indeterminate"], "percent": round(pct, 1),
                             "text": text, "stopping": job["stopped"]}
+            ai = self.ai_results
+            ai_stats = self._ai_stats(ai, self.findings) if ai else None
             start = max(since, self.log_first)
             lines = self.log[start - self.log_first:]
             return {"app": APP_ID, "version": VERSION, "boot": self.boot, "job": job_view, "status": self.status,
                     "idle_text": self.idle_text, "log": {"from": start, "lines": lines, "next": start + len(lines)},
                     "reports": self.reports_info(), "findings_version": self.findings_version,
-                    "findings_total": len(self.findings), "notice": self.notice}
+                    "findings_total": len(self.findings), "notice": self.notice, "ai_stats": ai_stats,
+                    "engines": list(self.engines), "baseline": dict(self.baseline_view)}
 
     # ------------------------------------------------------------ server-side file browser
     def fs_list(self, path, mode):
@@ -1179,12 +2241,17 @@ class Handler(BaseHTTPRequestHandler):
     def _route_post(self, app, path, body):
         ids = body.get("ids") or []
         if path == "/api/settings":
+            before = (app.s("site_dir"), app.s("baseline_dir"))
             app.update_settings(body.get("settings") or {})
+            if (app.s("site_dir"), app.s("baseline_dir")) != before:
+                threading.Thread(target=app._refresh_engines, daemon=True).start()
             return {"ok": True}
+        if path == "/api/preflight":
+            return app.preflight()
         if path == "/api/scan/start":
             if "settings" in body:
                 app.update_settings(body["settings"])
-            app.start_scan()
+            app.start_scan(bool(body.get("no_baseline")))
             return {"ok": True}
         if path == "/api/clean/plan":
             if "settings" in body:
@@ -1197,6 +2264,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/clean/cancel":
             app.clean_cancel()
             return {"ok": True}
+        if path == "/api/baseline/detect":
+            return app.baseline_detect()
+        if path == "/api/baseline/fetch":
+            return app.baseline_fetch(str(body.get("version") or ""))
         if path == "/api/job/stop":
             app.stop_job()
             return {"ok": True}
@@ -1216,6 +2287,21 @@ class Handler(BaseHTTPRequestHandler):
             return {"ok": True}
         if path == "/api/files/whitelist":
             return app.whitelist_add(ids)
+        if path == "/api/ai/review":
+            sel_files = body.get("files")
+            if sel_files is not None:
+                if not isinstance(sel_files, list):
+                    raise ApiError("Bad request.")
+                sel_files = [str(f) for f in sel_files[:20000]]
+            return app.start_ai_review(bool(body.get("dry_run")), sel_files)
+        if path == "/api/ai/candidates":
+            return app.ai_candidates()
+        if path == "/api/ai/signatures/prepare":
+            return app.ai_prepare_signatures()
+        if path == "/api/ai/signatures/apply":
+            return app.apply_signatures(body.get("signatures") or [])
+        if path == "/api/ai/review/remove_false_positives":
+            return app.remove_false_positives()
         if path == "/api/report/open":
             app.open_report(body.get("kind", ""))
             return {"ok": True}
@@ -1582,164 +2668,526 @@ PAGE = r'''<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
 <title>Scan Backdoors</title>
 <link rel="icon" type="image/png" href="__LOGO__">
 <style>
-:root{--bg:#171a21;--panel:#222733;--field:#11151c;--fg:#e6eaf2;--muted:#aab4c5;--accent:#4f8cff;--accent2:#3976e8;
---border:#394252;--sel:#294a7a;--danger:#7a2a33;--danger2:#9a3440}
+/* ── tokens ──────────────────────────────────────────────── */
+:root{
+  --bg:#0a0e17; --panel:#0f141f; --panel2:#151b28; --card:#151b28; --field:#151b28;
+  --line:#1c2434; --line2:#2e3a52;
+  --text:#e2e8f0; --mute:#94a3b8; --mute2:#64748b;
+  --acc:#3b82f6; --acc2:#2563eb; --sel:rgba(37,99,235,.25);
+  --btn:#1c2434; --btn2:#1c2434; --btn-hover:#242e42; --btn-border:#2e3a52;
+  --grid-bg:#0a0e17; --track:#1c2434; --pill:#1c2434; --pill-border:#2e3a52;
+  --pop-bg:#151b28; --row-hover:#0f141f; --input-text:#f1f5f9;
+  --hi:#fb7185; --hi-bg:rgba(251,113,133,.13); --hi-border:rgba(251,113,133,.32);
+  --med:#fbbf24; --med-bg:rgba(251,191,36,.13); --med-border:rgba(251,191,36,.32);
+  --low:#38bdf8; --low-bg:rgba(56,189,248,.13); --low-border:rgba(56,189,248,.32);
+  --ok:#34d399; --ok-bg:rgba(16,185,129,.2);
+  --gold:#fbbf24; --lavender:#818cf8; --sig:#fbbf24;
+  --danger:#fb7185; --danger-bg:rgba(244,63,94,.15); --danger-border:rgba(244,63,94,.3);
+  --code-bg:#080b12; --code-text:#cbd5e1; --code-head:#151b28;
+  --shadow:0 10px 28px rgba(0,0,0,.45);
+  --radius:10px;
+  --font-sans:Inter,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  --font-mono:"JetBrains Mono",ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace;
+  color-scheme:dark
+}
+@media (prefers-color-scheme:light){:root:not([data-theme="dark"]){
+  --bg:#eef1f6; --panel:#ffffff; --panel2:#f1f4f9; --card:#ffffff; --field:#f8fafc;
+  --line:#dde3ec; --line2:#c9d2e0;
+  --text:#1e293b; --mute:#64748b; --mute2:#94a3b8;
+  --acc:#2563eb; --acc2:#1d4ed8; --sel:rgba(37,99,235,.15);
+  --btn:#ffffff; --btn2:#f1f5f9; --btn-hover:#e2e8f0; --btn-border:#cbd5e1;
+  --grid-bg:#ffffff; --track:#e2e8f0; --pill:#f1f5f9; --pill-border:#e2e8f0;
+  --pop-bg:#ffffff; --row-hover:#f8fafc; --input-text:#0f172a;
+  --hi:#be123c; --hi-bg:rgba(225,29,72,.09); --hi-border:rgba(225,29,72,.26);
+  --med:#b45309; --med-bg:rgba(217,119,6,.11); --med-border:rgba(217,119,6,.3);
+  --low:#0369a1; --low-bg:rgba(2,132,199,.09); --low-border:rgba(2,132,199,.28);
+  --ok:#059669; --ok-bg:rgba(16,185,129,.15);
+  --gold:#d97706; --lavender:#6366f1; --sig:#d97706;
+  --danger:#e11d48; --danger-bg:rgba(244,63,94,.1); --danger-border:rgba(244,63,94,.35);
+  --code-bg:#0f172a; --code-text:#cbd5e1; --code-head:#1e293b;
+  --shadow:0 10px 30px rgba(15,23,42,.12);
+  color-scheme:light
+}}
+:root[data-theme="light"]{
+  --bg:#eef1f6; --panel:#ffffff; --panel2:#f1f4f9; --card:#ffffff; --field:#f8fafc;
+  --line:#dde3ec; --line2:#c9d2e0;
+  --text:#1e293b; --mute:#64748b; --mute2:#94a3b8;
+  --acc:#2563eb; --acc2:#1d4ed8; --sel:rgba(37,99,235,.15);
+  --btn:#ffffff; --btn2:#f1f5f9; --btn-hover:#e2e8f0; --btn-border:#cbd5e1;
+  --grid-bg:#ffffff; --track:#e2e8f0; --pill:#f1f5f9; --pill-border:#e2e8f0;
+  --pop-bg:#ffffff; --row-hover:#f8fafc; --input-text:#0f172a;
+  --hi:#be123c; --hi-bg:rgba(225,29,72,.09); --hi-border:rgba(225,29,72,.26);
+  --med:#b45309; --med-bg:rgba(217,119,6,.11); --med-border:rgba(217,119,6,.3);
+  --low:#0369a1; --low-bg:rgba(2,132,199,.09); --low-border:rgba(2,132,199,.28);
+  --ok:#059669; --ok-bg:rgba(16,185,129,.15);
+  --gold:#d97706; --lavender:#6366f1; --sig:#d97706;
+  --danger:#e11d48; --danger-bg:rgba(244,63,94,.1); --danger-border:rgba(244,63,94,.35);
+  --code-bg:#0f172a; --code-text:#cbd5e1; --code-head:#1e293b;
+  --shadow:0 10px 30px rgba(15,23,42,.12);
+  color-scheme:light
+}
+
+/* ── base ────────────────────────────────────────────────── */
 *{box-sizing:border-box}
+*{scrollbar-width:thin;scrollbar-color:var(--line2) transparent}
 html,body{height:100%;margin:0}
-body{display:flex;flex-direction:column;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
-button,input,select{font:inherit;color:inherit}
-header{display:flex;align-items:center;gap:12px;padding:6px 14px;background:var(--panel);border-bottom:1px solid var(--border)}
-.brand{display:flex;align-items:center;gap:10px;font-weight:600;font-size:16px;white-space:nowrap}
-.logo{width:40px;height:40px;border-radius:50%;object-fit:cover;box-shadow:0 0 0 1px var(--border),0 0 10px #22d3ee33}
-nav{display:flex;gap:4px}
-.tabbtn{background:transparent;border:1px solid transparent;border-radius:6px;padding:6px 14px;cursor:pointer;color:var(--muted)}
-.tabbtn:hover{background:var(--border)}
-.tabbtn.active{background:var(--sel);color:var(--fg)}
-.spacer{flex:1}
-.pill{padding:2px 10px;border-radius:99px;font-size:12px;background:#1b4332;color:#b7f0cd}
-.pill.off{background:#5a2028;color:#ffdce0}
-main{flex:1;min-height:0;position:relative}
-.tab{display:none;height:100%;padding:12px 14px;overflow:auto}
-.tab.active{display:block}
-#tab-run.active{display:grid;grid-template-rows:auto auto auto minmax(150px,3fr) auto minmax(80px,1fr);gap:8px;overflow:hidden}
-button{background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:6px 12px;cursor:pointer}
-button:hover:not(:disabled){background:var(--sel)}
+body{
+  background:var(--bg);color:var(--text);
+  font:13px/1.45 var(--font-sans);
+  display:flex;flex-direction:column;overflow:hidden;
+  -webkit-font-smoothing:antialiased;
+}
+::selection{background:#2563eb;color:#fff}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--line2);border-radius:4px}
+::-webkit-scrollbar-thumb:hover{background-color:var(--mute2)}
+button,select,input,textarea{font:inherit;color:inherit}
+button{background:var(--btn);border:1px solid var(--btn-border);border-radius:6px;padding:6px 10px;cursor:pointer;white-space:nowrap;line-height:1.4;color:var(--text);font-size:12px;transition:background .15s,border-color .15s,color .15s}
+button:hover:not(:disabled){background:var(--btn-hover);border-color:var(--btn-border)}
 button:disabled{opacity:.45;cursor:default}
-button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
-button.primary:hover:not(:disabled){background:var(--accent2)}
+button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px solid var(--acc);outline-offset:1px}
+button.primary{background:#2563eb;border-color:#2563eb;color:#fff;font-weight:600;box-shadow:0 1px 2px rgba(37,99,235,.25)}
+button.primary:hover:not(:disabled){background:#3b82f6;border-color:#3b82f6}
+button.primary:active:not(:disabled){background:#1d4ed8;border-color:#1d4ed8}
 button.danger{background:var(--danger);border-color:var(--danger);color:#fff}
-button.danger:hover:not(:disabled){background:var(--danger2)}
-button.ghost{background:transparent}
-input[type=text],select{background:var(--field);border:1px solid var(--border);border-radius:6px;padding:6px 9px;min-width:0}
-input[type=text]:focus,select:focus{outline:1px solid var(--accent)}
-fieldset{border:1px solid var(--border);border-radius:8px;margin:12px 0;padding:10px 14px}
-legend{padding:0 6px;color:var(--muted)}
-.grid{display:grid;grid-template-columns:230px 1fr auto;gap:8px 10px;align-items:center}
-.opts{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:10px 16px}
-.opts label{display:flex;flex-direction:column;gap:3px;color:var(--muted);font-size:13px}
-.flags{display:flex;flex-wrap:wrap;gap:8px 18px;margin-top:10px}
-.flags label{display:flex;align-items:center;gap:6px;cursor:pointer}
-.hint{color:var(--muted);font-size:12px}
-.row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.bar{flex:1;min-width:120px;height:14px;background:var(--field);border:1px solid var(--border);border-radius:7px;overflow:hidden;position:relative}
-.bar>div{height:100%;width:0;background:var(--accent);transition:width .3s}
-.bar.indet>div{width:30%;position:absolute;animation:slide 1.2s infinite ease-in-out}
+button.danger:hover:not(:disabled){filter:brightness(1.1)}
+button.ghost{background:transparent;border-color:transparent;color:var(--mute)}
+button.ghost:hover:not(:disabled){color:var(--text);border-color:var(--line2)}
+input[type=text],input[type=search],input[type=number],select,textarea{background:var(--field);border:1px solid var(--btn-border);border-radius:6px;padding:5px 8px;min-width:0;color:var(--input-text)}
+input[type=text]:focus,input[type=search]:focus,input[type=number]:focus,select:focus,textarea:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 1px var(--acc)}
+[hidden]{display:none!important}
+
+/* ── header ──────────────────────────────────────────────── */
+.top{display:flex;align-items:center;gap:10px;height:44px;padding:0 12px;border-bottom:1px solid var(--line);background:var(--panel);flex:none;z-index:30}
+.brand{display:flex;align-items:center;gap:10px;font-weight:600;font-size:14px;letter-spacing:-.01em;white-space:nowrap;color:var(--text)}
+.brand img{width:28px;height:28px;border-radius:8px;object-fit:cover;box-shadow:0 1px 3px rgba(0,0,0,.3)}
+nav{display:flex;align-items:stretch;height:44px;gap:4px;margin-left:14px}
+.toptab{background:none;border:0;border-bottom:2px solid transparent;border-radius:0;padding:0 12px;color:var(--mute);cursor:pointer;font-size:12px;font-weight:500;display:flex;align-items:center;gap:6px;transition:color .15s}
+.toptab svg{width:14px;height:14px;flex:none}
+.toptab:hover{color:var(--text)}
+.toptab[aria-selected="true"]{color:var(--text);border-bottom-color:var(--acc);font-weight:600}
+.toptab[aria-selected="true"] svg{color:var(--acc)}
+[data-theme="light"] .toptab[aria-selected="true"]{color:#2563eb}
+.sp{flex:1}
+.badge{display:inline-flex;align-items:center;gap:6px;font-size:11px;padding:2px 10px;border-radius:99px;background:var(--ok-bg);color:var(--ok);white-space:nowrap;font-weight:600;border:1px solid rgba(16,185,129,.3)}
+.badge::before{content:"";width:6px;height:6px;border-radius:50%;background:#10b981;animation:pulse 1.6s ease-in-out infinite}
+.badge.off{background:var(--danger-bg);color:var(--danger);border-color:var(--danger-border)}
+.badge.off::before{background:#f43f5e;animation:none}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.theme{display:flex;align-items:center;gap:2px;padding:4px;background:var(--pill);border:1px solid var(--pill-border);border-radius:99px}
+.theme button{display:flex;align-items:center;justify-content:center;width:20px;height:20px;padding:0;border:0;background:transparent;border-radius:99px;cursor:pointer;transition:background .15s,color .15s}
+.theme #themeLight svg{width:14px;height:14px}
+.theme #themeDark svg{width:12px;height:12px}
+.theme #themeLight{color:#64748b}
+.theme #themeDark{color:#94a3b8}
+.theme button:hover{color:var(--text);border-color:transparent;background:transparent}
+.theme #themeLight.on{background:#ffffff;color:#f59e0b;box-shadow:0 1px 2px rgba(15,23,42,.25)}
+.theme #themeDark.on{background:#2563eb;color:#ffffff}
+.top .ghost{font-size:12px;font-weight:500;padding:4px 10px;border-color:transparent;background:transparent;color:var(--mute)}
+.top .ghost:hover:not(:disabled){color:var(--danger);background:rgba(244,63,94,.1);border-color:transparent}
+#quitBtn{display:inline-flex;align-items:center;gap:6px}
+#quitBtn svg{width:14px;height:14px;flex:none}
+
+/* ── tabs ────────────────────────────────────────────────── */
+main{flex:1;min-height:0;position:relative;overflow:hidden;display:flex;flex-direction:column}
+.tab{display:none;height:100%;min-height:0}
+.tab.active{display:flex;flex-direction:column;overflow:hidden}
+#tab-settings.active{overflow:auto;padding:0;gap:0}
+#tab-run.active{gap:0;padding:0}
+
+/* ── run bar ─────────────────────────────────────────────── */
+.run{display:flex;align-items:center;gap:10px;padding:8px 12px;flex:none;flex-wrap:wrap;border-bottom:1px solid var(--line);background:var(--panel)}
+.run button{font-size:12.5px}
+.prog{position:relative;flex:1 1 160px;min-width:160px;height:8px;background:var(--track);border:1px solid var(--btn-border);border-radius:99px;overflow:hidden}
+.prog i{position:absolute;left:0;top:0;bottom:0;width:0;background:linear-gradient(90deg,#3b82f6,#6366f1,#22d3ee);border-radius:99px;transition:width .2s}
+.prog.indet i{width:30%;animation:slide 1.2s infinite ease-in-out}
 @keyframes slide{0%{left:-30%}100%{left:100%}}
-#progText{color:var(--muted);min-height:20px}
-.panel{border:1px solid var(--border);border-radius:8px;padding:8px;display:flex;flex-direction:column;min-height:0}
-.panel>h4{margin:0 0 6px;font-weight:500;color:var(--muted)}
-.tablewrap{flex:1;min-height:0;overflow:auto;border:1px solid var(--border);border-radius:6px;background:var(--field);outline:none}
-table{border-collapse:collapse;width:100%;min-width:900px;table-layout:fixed}
-th{position:sticky;top:0;background:var(--panel);text-align:left;padding:6px 8px;cursor:pointer;user-select:none;border-bottom:1px solid var(--border);white-space:nowrap}
-th:hover{background:var(--sel)}
-th .arr{color:var(--accent)}
-td{padding:4px 8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;border-bottom:1px solid #1d222c}
-tr.lv-HIGH td{background:#5a2028;color:#ffdce0}
-tr.lv-MEDIUM td{background:#5b451d;color:#fff0c2}
-tr.lv-LOW td{background:#174a43;color:#d5fff5}
-tr.sel td{background:var(--sel);color:#fff;box-shadow:inset 0 1px 0 var(--accent),inset 0 -1px 0 var(--accent)}
-tr{cursor:default}
-pre{margin:0;white-space:pre-wrap;word-break:break-all;font:12.5px/1.45 ui-monospace,Consolas,Menlo,monospace}
-#preview{background:var(--field);border:1px solid var(--border);border-radius:6px;padding:8px;max-height:150px;overflow:auto;min-height:48px;user-select:text;white-space:pre-wrap;word-break:break-all;font:12.5px/1.45 ui-monospace,Consolas,Menlo,monospace}
-#log{flex:1;min-height:0;overflow:auto;background:var(--field);border:1px solid var(--border);border-radius:6px;padding:8px;user-select:text}
-footer{display:flex;gap:12px;align-items:center;padding:5px 14px;background:var(--panel);border-top:1px solid var(--border);font-size:13px}
-footer code{color:var(--muted)}
-#ctx{position:fixed;display:none;z-index:50;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:4px;min-width:230px;box-shadow:0 6px 24px #0008}
-#ctx div{padding:6px 12px;border-radius:5px;cursor:pointer}
-#ctx div:hover{background:var(--sel)}
-#ctx hr{border:0;border-top:1px solid var(--border);margin:4px 0}
-.overlay{position:fixed;inset:0;background:#000a;display:flex;align-items:center;justify-content:center;z-index:100}
-.dlg{background:var(--panel);border:1px solid var(--border);border-radius:10px;width:min(640px,92vw);max-height:86vh;display:flex;flex-direction:column;box-shadow:0 10px 40px #000a}
+.progText{color:var(--mute);font-size:11px;font-family:var(--font-mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:38%}
+.menu{position:relative}
+.menu .pop{display:none;position:absolute;right:0;top:100%;margin-top:6px;background:var(--pop-bg);border:1px solid var(--btn-border);border-radius:8px;padding:4px 0;min-width:220px;z-index:40;box-shadow:0 20px 25px -5px rgba(2,6,23,.45),0 8px 10px -6px rgba(2,6,23,.45)}
+.menu.open .pop{display:block}
+.pop button,.pop a{display:flex;align-items:center;gap:7px;width:100%;text-align:left;border:0;background:none;padding:6px 12px;border-radius:0;cursor:pointer;color:var(--text);text-decoration:none;font-size:12px;white-space:normal}
+.pop button:hover,.pop a:hover{background:var(--btn-hover);border-color:transparent}
+.pop button:disabled,.pop a[aria-disabled="true"]{opacity:.4;cursor:default;pointer-events:none}
+.pop hr{border:0;border-top:1px solid var(--btn-border);margin:4px 0}
+.pop .lbl{display:block;padding:4px 12px;color:var(--mute);font-size:10px;letter-spacing:.05em;text-transform:uppercase;font-weight:600}
+.ai-stats{display:inline-flex;align-items:center;white-space:nowrap;padding:2px 10px;background:var(--btn);border:1px solid var(--btn-border);border-radius:99px;color:var(--mute);font-size:11px;font-family:var(--font-mono)}
+.ai-stats b{color:var(--text);font-weight:600}
+#startBtn,#stopBtn{display:inline-flex;align-items:center;gap:6px}
+#startBtn svg{width:14px;height:14px;flex:none}
+#stopBtn{font-size:12px;font-weight:500}
+#stopBtn .sq{width:10px;height:10px;border-radius:2px;background:currentColor;flex:none}
+#stopBtn:not(:disabled){background:rgba(225,29,72,.15);border-color:rgba(244,63,94,.4);color:var(--danger)}
+#stopBtn:not(:disabled):hover{background:rgba(225,29,72,.25)}
+#stopBtn:disabled{opacity:1;background:var(--btn2);border-color:var(--btn-border);color:var(--mute2)}
+.ai-btn-ico{color:#818cf8}
+[data-theme="light"] .ai-btn-ico{color:#6366f1}
+#aiBtn,#candBtn,#fpBtn,#repBtn{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:500}
+#aiBtn{gap:5px}
+#repBtn svg{width:12px;height:12px;color:var(--mute);flex:none}
+.cbtn-ico{width:14px;height:14px;color:#10b981;flex:none}
+.cbadge{padding:1px 6px;border-radius:4px;background:rgba(244,63,94,.2);color:var(--danger);font-size:10px;font-family:var(--font-mono)}
+[data-theme="light"] .cbadge{color:#be123c}
+.hint{color:var(--mute2);font-size:11.5px;white-space:nowrap}
+#aiHint{overflow:hidden;text-overflow:ellipsis}
+
+/* ── toolbar (filters + actions) ─────────────────────────── */
+.toolbar{background:var(--panel);border-bottom:1px solid var(--line);padding:8px 12px;display:flex;flex-direction:column;gap:8px;flex:none}
+.filtersRow{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.chip{border-radius:99px;padding:4px 10px;cursor:pointer;font-size:12px;font-weight:500;background:var(--btn2);border:1px solid var(--btn-border);color:var(--text);transition:background .15s,border-color .15s}
+.chip b{font-weight:600;margin-left:2px;font-family:var(--font-mono);color:var(--mute)}
+#c-HIGH{color:#f43f5e}#c-MEDIUM{color:#f59e0b}#c-LOW{color:#94a3b8}
+#c-ALL{color:var(--mute)}.chip[aria-pressed="true"] #c-ALL{color:#fff}
+.chip[aria-pressed="true"]{background:#2563eb;border-color:#3b82f6;color:#fff;font-weight:600}
+.chip[data-l="HIGH"]:not([aria-pressed="true"]):hover{border-color:rgba(244,63,94,.5)}
+.chip[data-l="MEDIUM"]:not([aria-pressed="true"]):hover{border-color:rgba(245,158,11,.5)}
+.chip[data-l="LOW"]:not([aria-pressed="true"]):hover{border-color:rgba(14,165,233,.5)}
+.chip:not([data-l]):not([aria-pressed="true"]):hover,.chip[data-l="ALL"]:not([aria-pressed="true"]):hover{border-color:var(--btn-border);background:var(--btn-hover)}
+.searchWrap{position:relative;width:256px;flex:0 1 256px;min-width:160px}
+.searchWrap svg{position:absolute;left:10px;top:50%;transform:translateY(-50%);width:14px;height:14px;color:var(--mute);pointer-events:none}
+.searchWrap input{width:100%;padding:4px 10px 4px 32px;font-size:12px;border-radius:6px}
+.filtersRow select{font-size:12px;cursor:pointer;padding:4px 10px;border-radius:6px}
+#fReset{font-size:12px;font-weight:500;padding:4px 10px;background:var(--btn2)}
+#goRun{font-size:12px;font-weight:600;padding:6px 14px}
+.count{color:var(--mute);margin-left:auto;font-size:12px;white-space:nowrap;font-family:var(--font-mono)}
+.actionsRow{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.actionsRow button{font-size:12px;font-weight:500;padding:4px 10px;display:inline-flex;align-items:center;gap:6px}
+.actionsRow button svg{width:14px;height:14px;flex:none}
+.actionsRow button.danger{background:rgba(244,63,94,.1);border-color:rgba(244,63,94,.3);color:var(--danger)}
+.actionsRow button.danger:hover:not(:disabled){background:rgba(244,63,94,.2);border-color:rgba(244,63,94,.3)}
+.actionsRow .hint{margin-left:auto;white-space:nowrap}
+@media(max-width:1279px){.actionsRow .hint{display:none}}
+.ico-amber{color:#f59e0b}.ico-orange{color:#fb923c}.ico-purple{color:#c084fc}.ico-blue{color:#3b82f6}.ico-rose{color:#f43f5e}
+
+/* ── main split: table + bottom panel ────────────────────── */
+.main{flex:1;min-height:0;display:flex;flex-direction:column;padding:0}
+.tablewrap{flex:1;min-height:120px;overflow:auto;border:0;border-radius:0;background:var(--grid-bg);outline:none;user-select:none;-webkit-user-select:none}
+.tablewrap:focus-visible{outline:2px solid var(--acc);outline-offset:1px}
+table{border-collapse:separate;border-spacing:0;width:100%;table-layout:fixed}
+thead th{position:sticky;top:0;background:var(--panel);text-align:left;font-weight:600;font-size:11px;letter-spacing:0;padding:8px;border-bottom:1px solid var(--line);cursor:pointer;user-select:none;z-index:2;white-space:nowrap;color:var(--mute);transition:color .15s}
+thead th:hover{color:var(--text)}
+th[data-col="file"],th[data-col="date"],th[data-col="signature"],#aiCol{padding-left:12px;padding-right:12px}
+th.chk{width:34px;text-align:center;cursor:default;padding:8px 4px}
+th.chk:hover{color:var(--mute)}
+#rowSelAll,#tbody input[data-chk]{accent-color:#2563eb;width:14px;height:14px;cursor:pointer;margin:0;vertical-align:middle}
+thead th .arr{color:var(--acc);margin-left:3px;font-size:10px}
+thead th.num{text-align:right}
+thead th.num .arr{margin-left:3px}
+td{padding:6px 8px;border-bottom:1px solid rgba(28,36,52,.8);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums;font-size:12px;color:var(--text)}
+[data-theme="light"] td{border-bottom-color:rgba(226,232,240,.7)}
+td.chk{text-align:center;padding:6px 4px}
+#tbody td:nth-child(4),#tbody td:nth-child(7),#tbody td:nth-child(9),#tbody td:nth-child(10){padding-left:12px;padding-right:12px}
+tbody tr{cursor:default;transition:background .1s}
+tbody tr:hover{background:var(--row-hover)}
+tbody tr.sel{background:var(--sel)}
+tbody tr.sel:hover{background:var(--sel)}
+.num{text-align:right;font-family:var(--font-mono);font-size:12px;color:var(--mute)}
+#tbody td:nth-child(3).num{color:var(--text)}
+td:nth-child(4){color:var(--text)}
+td:nth-child(7){font-family:var(--font-mono);font-size:11px;color:var(--mute)}
+td:nth-child(8){color:var(--mute)}
+td:nth-child(9){color:var(--text)}
+.lv{display:inline-block;min-width:0;text-align:center;border-radius:4px;font-size:10px;font-weight:700;padding:2px 8px;letter-spacing:.025em;border:0}
+.lv.HIGH{background:#e11d48;color:#fff}
+.lv.MEDIUM{background:#f59e0b;color:#0f172a}
+.lv.LOW{background:#242e42;color:#cbd5e1}
+[data-theme="light"] .lv.HIGH{background:#e11d48;color:#fff}
+[data-theme="light"] .lv.MEDIUM{background:#f59e0b;color:#0f172a}
+[data-theme="light"] .lv.LOW{background:#e2e8f0;color:#334155}
+tr.empty-row td{padding:60px 12px;text-align:center;color:var(--mute);cursor:default;font-size:13px;font-weight:500}
+.gutter{height:6px;flex:none;cursor:row-resize;display:flex;align-items:center;justify-content:center;background:transparent;transition:background .15s}
+.gutter::after{content:"";width:40px;height:4px;border-radius:99px;background:var(--line2);transition:background .15s}
+.gutter:hover,.gutter.drag{background:rgba(59,130,246,.15)}
+.gutter:hover::after,.gutter.drag::after{background:#3b82f6}
+
+/* ── bottom panel: Details / Log ─────────────────────────── */
+.bottom{flex:none;height:230px;min-height:60px;border:0;border-top:1px solid var(--line);border-radius:0;background:var(--panel);display:flex;flex-direction:column;overflow:hidden}
+.bottom.collapsed{height:34px!important;min-height:0;overflow:hidden}
+.btabs{display:flex;align-items:center;gap:4px;padding:4px 12px;border-bottom:1px solid var(--line);flex:none;min-height:37px}
+.btab{background:none;border:1px solid transparent;border-radius:4px;padding:4px 10px;color:var(--mute);cursor:pointer;font-size:12px;font-weight:500;transition:color .15s,background .15s}
+.btab:hover{color:var(--text)}
+.btab[aria-selected="true"]{color:var(--text);background:var(--btn);border-color:var(--btn-border);font-weight:600;box-shadow:0 1px 2px rgba(2,6,23,.15)}
+[data-theme="light"] .btab[aria-selected="true"]{color:#0f172a}
+.btabs .sp{flex:1}
+.btabs button.btn{font-size:11px;padding:3px 9px}
+.engBar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;color:var(--mute);font-size:11.5px;padding:2px 0 10px}
+.engBar .btn{font-size:11px;padding:3px 10px}
+#eng{overflow:auto}
+.engTbl{width:100%;border-collapse:collapse;font-size:12px}
+.engTbl th{text-align:left;color:var(--mute2);font-weight:600;font-size:10px;text-transform:uppercase;letter-spacing:.05em;padding:4px 12px 4px 0;border-bottom:1px solid var(--line)}
+.engTbl td{padding:7px 12px 7px 0;border-bottom:1px solid var(--line);vertical-align:top}
+.engName{font-weight:600;color:var(--text);white-space:nowrap}
+.engVer{font-family:var(--font-mono);color:var(--mute);white-space:nowrap}
+.engYes{color:var(--ok);font-weight:600}
+.engBad{color:var(--danger);font-weight:600}
+.engNo{color:var(--mute2)}
+.engDir{font-family:var(--font-mono);font-size:10.5px;color:var(--mute2);white-space:normal;overflow-wrap:anywhere;max-width:46ch}
+#foldBtn{color:var(--mute);background:var(--btn);border:1px solid var(--btn-border);border-radius:4px;padding:4px;display:inline-flex;align-items:center;justify-content:center}
+.bottom.collapsed #foldBtn svg{transform:rotate(180deg)}
+#foldBtn svg{width:14px;height:14px;transition:transform .2s}
+.detQuickPath{display:none;flex:0 1 auto;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--font-mono);font-size:11px;color:var(--mute2)}
+@media(min-width:1100px){.detQuickPath{display:inline-block}}
+.pane{flex:1;overflow:auto;padding:12px;font:12.5px/1.5 var(--font-sans)}
+.pane.log{font:11px/1.6 var(--font-mono);white-space:pre-wrap;word-break:break-word;margin:0;background:var(--code-bg);color:var(--code-text);padding:12px}
+.empty{color:var(--mute2)}
+.multi{color:var(--mute);font-size:12px;margin-bottom:8px;font-weight:600}
+
+/* details pane (mockup-style) */
+.detWrap{display:flex;flex-direction:column;gap:10px}
+.detMeta{display:flex;flex-direction:column;gap:8px;min-width:0}
+.detPath{display:flex;align-items:center;gap:8px;background:var(--card);border:1px solid var(--line);border-radius:6px;padding:8px}
+.detPathTop{min-width:0;flex:1}
+.detLabel{display:block;font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:var(--mute);font-weight:600}
+.detPathVal{font-family:var(--font-mono);font-size:12px;color:var(--text);white-space:normal;overflow-wrap:anywhere;line-height:1.4;margin-top:2px}
+.detCopyBtn{flex:none;font-size:11px;font-weight:500;padding:4px 8px;border-radius:4px;background:var(--btn2);border:0;color:var(--mute)}
+.detCopyBtn:hover:not(:disabled){background:var(--btn-hover)}
+.detGrid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.detCard{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:8px;min-width:0}
+.detVal{font-family:var(--font-mono);font-size:11px;color:var(--mute);white-space:normal;overflow-wrap:anywhere;line-height:1.4;margin-top:2px}
+.detSig{font-family:var(--font-sans);font-size:11px;font-weight:500;color:var(--sig)}
+.detAiBox{background:rgba(16,185,129,.05);border:1px solid rgba(16,185,129,.25);border-radius:6px;padding:10px}
+.detAiBox.v-real{background:rgba(244,63,94,.1);border-color:rgba(244,63,94,.35)}
+.detAiBox.v-real .detLabel{color:var(--danger)}
+.detAiBox.v-fp .detLabel{color:var(--ok)}
+.detAiBox.v-uncertain{background:rgba(245,158,11,.08);border-color:rgba(245,158,11,.3)}
+.detAiBox.v-uncertain .detLabel{color:#f59e0b}
+.detAiBox.v-error{background:rgba(249,115,22,.08);border-color:rgba(249,115,22,.3)}
+.detAiBox.v-error .detLabel{color:#fb923c}
+.detAiHead{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.detAiHead .detLabel{color:var(--ok)}
+.detAiReason{margin:4px 0 0;font-size:12px;line-height:1.625;color:var(--mute);white-space:pre-wrap;word-break:break-word}
+.detCode{display:flex;flex-direction:column;flex:none;min-height:0;max-height:170px;background:var(--code-bg);border:1px solid var(--line);border-radius:6px;overflow:hidden}
+.detCodeHead{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:4px 10px;background:var(--code-head);border-bottom:1px solid var(--line);font-family:var(--font-mono);font-size:11px;color:#94a3b8;flex:none}
+.detCodeFile{font-family:var(--font-mono);font-size:10.5px;color:var(--mute);text-transform:none;letter-spacing:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:55%}
+.detCodeBody{flex:1;margin:0;padding:10px;overflow:auto;font:11px/1.25 var(--font-mono);color:var(--code-text);white-space:pre-wrap;word-break:break-word}
+@media(max-width:1099px){.detWrap{flex-direction:row;height:100%}.detMeta{flex:0 0 46%;min-width:0;overflow:auto}.detCode{flex:1;min-width:0;max-height:none;height:100%}}
+@media(min-width:1500px){.detWrap{flex-direction:row;height:100%}.detMeta{flex:0 0 46%;min-width:0;overflow:auto}.detCode{flex:1;min-width:0;max-height:none;height:100%}}
+
+/* AI badge + chip */
+.ai-badge{display:inline-flex;align-items:center;gap:4px;padding:0;border-radius:0;background:transparent;font-size:12px;white-space:nowrap;font-weight:500;font-family:var(--font-sans)}
+td.ai-real,td.ai-fp,td.ai-uncertain,td.ai-error,td.ai-none{background:transparent}
+.ai-badge.ai-real{color:#fb7185;font-weight:600}.ai-badge.ai-fp{color:#34d399}.ai-badge.ai-uncertain{color:#f59e0b}.ai-badge.ai-error{color:#fb923c}.ai-badge.ai-none{color:#475569}
+[data-theme="light"] .ai-badge.ai-real{color:#e11d48}
+[data-theme="light"] .ai-badge.ai-fp{color:#059669}
+[data-theme="light"] .ai-badge.ai-uncertain{color:#b45309}
+[data-theme="light"] .ai-badge.ai-error{color:#c2410c}
+[data-theme="light"] .ai-badge.ai-none{color:#94a3b8}
+
+/* ── footer ──────────────────────────────────────────────── */
+.footer{flex:0 0 auto;display:flex;gap:8px;align-items:center;padding:0 12px;background:var(--panel);border-top:1px solid var(--line);font-size:11px;color:var(--mute);height:28px;z-index:30}
+.footer #status{color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.footer code{color:#60a5fa;font-family:var(--font-mono);font-size:11px;cursor:pointer}
+.footer code:hover{text-decoration:underline}
+[data-theme="light"] .footer code{color:#2563eb}
+.footer .ver{font-family:var(--font-mono);font-weight:600;color:var(--text)}
+.footer .dot{color:var(--mute2)}
+.footer .engines{color:var(--mute2);font-family:var(--font-mono);font-size:10.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:46vw}
+
+/* ── settings tab ────────────────────────────────────────── */
+.setWrap{max-width:896px;width:100%;margin:0 auto;padding:24px 24px 28px;display:flex;flex-direction:column;gap:20px}
+.setHead{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px;border-bottom:1px solid var(--line);padding-bottom:12px}
+.setHead h1{font-size:16px;font-weight:700;margin:0;letter-spacing:-.01em}
+.setHead p{color:var(--mute);font-size:12px;margin:2px 0 0;max-width:640px}
+.setGrid{display:grid;grid-template-columns:1fr;gap:16px}
+@media(min-width:768px){.setGrid{grid-template-columns:1fr 1fr;align-items:start}}
+fieldset.card{border:1px solid var(--line);border-radius:12px;margin:0;padding:16px;background:var(--panel);display:flex;flex-direction:column;gap:12px;min-width:0}
+fieldset.card legend{padding:0;font-size:12px;text-transform:uppercase;letter-spacing:.05em;font-weight:700;color:var(--mute)}
+fieldset.card.card-blue legend{color:#3b82f6}
+fieldset.card.card-amber legend{color:#f59e0b}
+fieldset.card.card-indigo legend{color:#6366f1}
+fieldset.card.card-emerald legend{color:#10b981}
+.grid{display:grid;grid-template-columns:1fr auto;gap:12px 8px;align-items:center}
+.grid label{grid-column:1/-1;font-size:12px;font-weight:500;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:-8px}
+.grid input[type=text]{grid-column:1;min-width:0;font-family:var(--font-mono);font-size:12px;padding:6px 12px;border-radius:6px}
+.opts{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px}
+.opts label{display:flex;flex-direction:column;gap:4px;color:var(--text);font-size:12px;font-weight:500}
+.opts label input{width:100%;font-family:var(--font-mono);font-size:12px;padding:6px 12px;border-radius:6px}
+.grid button{font-size:12px;font-weight:500;padding:6px 12px;border-radius:6px}
+.flags{display:flex;flex-wrap:wrap;gap:7px 16px}
+.flags label{display:flex;align-items:center;gap:8px;cursor:pointer;font-size:12px;color:var(--text)}
+.flags input[type=checkbox]{accent-color:#2563eb;width:14px;height:14px;cursor:pointer}
+.card .hint{white-space:normal;line-height:1.5;color:var(--mute);font-size:12px}
+.setNote{color:var(--mute2);font-size:12px;text-align:center}
+
+/* ── dialogs / toasts / context menu ─────────────────────── */
+#ctx{position:fixed;display:none;z-index:60;background:var(--pop-bg);border:1px solid var(--btn-border);border-radius:8px;padding:4px 0;width:208px;box-shadow:0 25px 50px -12px rgba(2,6,23,.5);font-size:12px}
+#ctx div{padding:6px 12px;display:flex;align-items:center;gap:8px;cursor:pointer;color:var(--text)}
+#ctx div:hover{background:var(--btn-hover)}
+#ctx hr{border:0;border-top:1px solid var(--btn-border);margin:4px 0}
+.overlay{position:fixed;inset:0;background:rgba(2,6,23,.7);display:flex;align-items:center;justify-content:center;z-index:100;backdrop-filter:blur(4px);padding:16px}
+.dlg{background:var(--panel);border:1px solid var(--btn-border);border-radius:12px;width:min(768px,92vw);max-height:88vh;display:flex;flex-direction:column;box-shadow:0 25px 50px -12px rgba(2,6,23,.6)}
 .dlg.wide{width:min(760px,94vw)}
-.dlg h3{margin:0;padding:12px 16px;border-bottom:1px solid var(--border);font-size:16px}
-.dlg .body{padding:14px 16px;overflow:auto;white-space:pre-wrap;word-break:break-word}
-.dlg .btns{padding:10px 16px;border-top:1px solid var(--border);display:flex;gap:8px;justify-content:flex-end}
-.dlg.error h3{color:#ff9aa5}.dlg.warn h3{color:#ffd27a}
-#toasts{position:fixed;right:14px;top:60px;display:flex;flex-direction:column;gap:8px;z-index:200}
-.toast{background:var(--panel);border:1px solid var(--border);border-left:4px solid var(--accent);border-radius:6px;padding:9px 14px;max-width:420px;box-shadow:0 6px 24px #0008;white-space:pre-wrap}
-.toast.error{border-left-color:#ff6b7d}.toast.ok{border-left-color:#4cc38a}
-.fsbar{display:flex;gap:6px;margin-bottom:8px;align-items:center}.fsbar input{flex:1}
-.fslist{border:1px solid var(--border);border-radius:6px;background:var(--field);height:300px;overflow:auto}
-.fslist div{padding:5px 10px;cursor:pointer;display:flex;justify-content:space-between;gap:10px}
-.fslist div:hover{background:var(--sel)}.fslist div.picked{background:var(--sel)}
-.fslist small{color:var(--muted)}
-.logbtns{display:flex;gap:6px;margin-left:auto}
-</style></head>
+.dlg h3{margin:0;padding:12px 16px;border-bottom:1px solid var(--line);font-size:14px;font-weight:700;color:var(--text);letter-spacing:.01em}
+.dlg .body{padding:16px;overflow:auto;white-space:pre-wrap;word-break:break-word;font-size:12px;line-height:1.6;color:var(--text)}
+.dlg .btns{padding:10px 16px;border-top:1px solid var(--line);background:var(--panel2);display:flex;gap:8px;justify-content:flex-end}
+.dlg.error h3{color:var(--danger)}
+.dlg.warn h3{color:var(--gold)}
+#toasts{position:fixed;right:16px;bottom:40px;display:flex;flex-direction:column;gap:8px;z-index:220}
+.toast{background:var(--panel);border:1px solid var(--line2);border-left:4px solid var(--acc);border-radius:8px;padding:9px 14px;max-width:440px;box-shadow:var(--shadow);white-space:pre-wrap;font-size:12.5px}
+.toast.error{border-left-color:var(--danger)}
+.toast.ok{border-left-color:var(--ok)}
+.fsbar{display:flex;gap:6px;margin-bottom:8px;align-items:center}
+.fsbar input{flex:1}
+.fslist{border:1px solid var(--line);border-radius:8px;background:var(--field);height:280px;overflow:auto}
+.fslist div{padding:5px 11px;cursor:pointer;display:flex;justify-content:space-between;gap:12px;font-size:12.5px;color:var(--text)}
+.fslist div:hover{background:var(--panel2)}
+.fslist div.picked{background:var(--sel)}
+.fslist small{color:var(--mute2);font-family:var(--font-mono);font-size:11px}
+
+/* ── wide screens: table 2/3 + Detail/Log panel 1/3 (right column) ── */
+@media(min-width:1100px){
+  .main{flex-direction:row}
+  .tablewrap{flex:0 0 auto;width:calc((100% - 6px) * 0.6667);min-width:0;min-height:0}
+  .gutter{flex:0 0 auto;width:6px;height:auto;cursor:col-resize}
+  .gutter::after{width:4px;height:40px}
+  .bottom{flex:1 1 0;width:auto;height:auto;min-height:0;min-width:0;overflow:hidden;border-top:0;border-left:1px solid var(--line)}
+  .bottom.collapsed{height:auto!important;min-height:0;overflow:hidden}
+  #foldBtn{display:none}
+}
+</style>
+</head>
 <body>
-<header>
-  <div class="brand"><img class="logo" src="__LOGO__" alt="" width="40" height="40"><span>Scan Backdoors</span></div>
-  <nav>
-    <button class="tabbtn" data-tab="settings">Settings</button>
-    <button class="tabbtn" data-tab="run">Run and results</button>
+<header class="top">
+  <div class="brand"><img src="__LOGO__" alt="" width="26" height="26"><span>Scan Backdoors</span></div>
+  <nav role="tablist">
+    <button class="toptab" role="tab" data-tab="settings" aria-selected="false"><svg fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><circle cx="12" cy="12" r="3" stroke-width="2"/></svg>Settings</button>
+    <button class="toptab" role="tab" data-tab="run" aria-selected="true"><svg fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>Run and results</button>
   </nav>
-  <div class="spacer"></div>
-  <span id="conn" class="pill off">connecting…</span>
-  <button id="quitBtn" class="ghost" title="Stop the local server">Quit server</button>
+  <span class="sp"></span>
+  <span id="conn" class="badge off">connecting…</span>
+  <div class="theme" role="group" aria-label="Theme">
+    <button id="themeLight" type="button" title="Light theme" aria-pressed="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg></button>
+    <button id="themeDark" type="button" title="Dark theme" aria-pressed="true"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg></button>
+  </div>
+  <button id="quitBtn" class="ghost" title="Stop the local server"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>Quit server</button>
 </header>
 <main>
   <section id="tab-settings" class="tab">
-    <div id="pathGrid" class="grid"></div>
-    <fieldset><legend>Scan options</legend>
-      <div id="optGrid" class="opts"></div>
-      <div id="flagRow" class="flags"></div>
-    </fieldset>
-    <fieldset><legend>Mass cleanup (clean_malware.py)</legend>
-      <div id="cleanRow" class="flags" style="margin-top:0"></div>
-    </fieldset>
-    <div class="row"><span class="hint">Settings are saved automatically and applied on the next launch.</span><span class="spacer"></span>
-      <button id="goRun">Go to run →</button></div>
+    <div class="setWrap">
+      <header class="setHead">
+        <div>
+          <h1>Scanner &amp; Engine Configuration</h1>
+          <p>Configure target filesystem paths, heuristic thresholds, exclusions, and the local AI review endpoint.</p>
+        </div>
+        <button id="goRun" class="primary">Go to run →</button>
+      </header>
+      <div class="setGrid">
+        <fieldset class="card card-blue"><legend>1. Scan scope &amp; targets</legend>
+          <div id="pathGrid" class="grid"></div>
+        </fieldset>
+        <fieldset class="card card-amber"><legend>2. Heuristic scoring &amp; flags</legend>
+          <div id="optGrid" class="opts"></div>
+          <div id="flagRow" class="flags"></div>
+        </fieldset>
+        <fieldset class="card card-emerald"><legend>3. Mass cleanup</legend>
+          <div id="cleanRow" class="flags"></div>
+          <div class="hint">Mass cleanup (clean_malware.py) acts on files from the current report. Nothing is deleted permanently without the flag — everything is quarantined first.</div>
+        </fieldset>
+        <fieldset class="card card-indigo"><legend>4. AI review (local model)</legend>
+          <div class="flags" id="aiFlagRow"></div>
+          <div class="opts" id="aiGrid"></div>
+          <div class="hint">The AI reviews the suspicious files from the current report and stores the verdicts in the CSV (columns “AI Verdict” / “AI Comment”). The scanner's own Verdict column is never overwritten. Only localhost endpoints are allowed, and the endpoint is validated before any request is sent. File contents and snippets are sent to that endpoint.</div>
+        </fieldset>
+      </div>
+      <div class="setNote">Settings are saved automatically and applied on the next launch.</div>
+    </div>
   </section>
 
   <section id="tab-run" class="tab">
-    <div class="row">
-      <button id="startBtn" class="primary">▶ Start scan</button>
-      <button id="stopBtn" disabled>■ Stop</button>
-      <div id="bar" class="bar"><div id="barFill"></div></div>
-    </div>
-    <div id="progText"></div>
-    <div class="row"><span>Reports:</span>
-      <button data-rep="csv" disabled>📂 CSV</button><button data-rep="xlsx" disabled>📂 XLSX</button><button data-rep="json" disabled>📂 JSON</button>
-      <button id="repFolder">📁 Reports folder</button>
-      <span class="hint">Download:</span><a class="hint" href="/download/csv">CSV</a><a class="hint" href="/download/xlsx">XLSX</a><a class="hint" href="/download/json">JSON</a>
-    </div>
-    <div class="panel">
-      <div class="row" style="margin-bottom:6px">
-        <span>Level:</span>
-        <select id="fLevel"><option>All</option><option>HIGH</option><option>MEDIUM</option><option>LOW</option></select>
-        <span>Search (file / signature):</span><input id="fQuery" type="text" size="26">
-        <button id="fReset">Reset filters</button>
-        <span class="spacer"></span><span id="count" class="hint"></span>
+    <section class="run">
+      <button id="startBtn" class="primary"><svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path d="M6.3 2.841A1.5 1.5 0 004 4.11V15.89a1.5 1.5 0 002.3 1.269l9.344-5.89a1.5 1.5 0 000-2.538L6.3 2.84z"/></svg><span>Start scan</span></button>
+      <button id="stopBtn" disabled><span class="sq"></span><span>Stop</span></button>
+      <div class="prog" id="prog" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i id="progFill"></i></div>
+      <span class="progText" id="progText"></span>
+      <button id="aiBtn" disabled title="Enable AI review in the Settings tab first"><span class="ai-btn-ico">🤖</span><span>AI review</span></button>
+      <span class="ai-stats" id="aiStats" hidden></span>
+      <button id="fpBtn" disabled><span>🧹</span><span>Remove false positives</span></button>
+      <button id="candBtn" disabled title="Enable AI review in the Settings tab first"><svg class="cbtn-ico" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M19.428 15.428a2 2 0 00-1.022-.547l-2.387-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a2 2 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A2 2 0 009 10.172V5L8 4z"/></svg><span>Candidates</span></button>
+      <span class="hint" id="aiHint"></span>
+      <div class="menu" id="repMenu">
+        <button id="repBtn" aria-haspopup="true" aria-expanded="false" aria-controls="repPop"><span>Reports</span><svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z" clip-rule="evenodd"/></svg></button>
+        <div class="pop" id="repPop" role="menu">
+          <button class="popbtn" id="repFolder">📁 Open reports folder</button><hr>
+          <span class="lbl">Open</span>
+          <button class="popbtn" data-rep="csv" disabled>📂 CSV</button>
+          <button class="popbtn" data-rep="xlsx" disabled>📂 XLSX</button>
+          <button class="popbtn" data-rep="json" disabled>📂 JSON</button><hr>
+          <span class="lbl">Download</span>
+          <a class="popbtn" href="/download/csv" data-dl="csv" aria-disabled="true">⬇ Download CSV</a>
+          <a class="popbtn" href="/download/xlsx" data-dl="xlsx" aria-disabled="true">⬇ Download XLSX</a>
+          <a class="popbtn" href="/download/json" data-dl="json" aria-disabled="true">⬇ Download JSON</a>
+        </div>
       </div>
-      <div class="row" style="margin-bottom:6px">
-        <button data-act="reveal">📁 Show file</button>
-        <button data-act="quarantine">📦 Quarantine</button>
-        <button data-act="delete" class="danger">🗑 Delete from disk</button>
-        <button id="cleanBtn">🧹 Mass cleanup</button>
-        <span class="hint">Click, Ctrl/Shift+click or Ctrl+A to select. Right-click for more. “Mass cleanup” removes the known families (.htaccess locks, filefuns) across the whole site.</span>
+    </section>
+
+    <div class="toolbar">
+      <div class="filtersRow">
+        <button class="chip" data-l="ALL" aria-pressed="true">All<b id="c-ALL"></b></button>
+        <button class="chip" data-l="HIGH" aria-pressed="false">High<b id="c-HIGH"></b></button>
+        <button class="chip" data-l="MEDIUM" aria-pressed="false">Medium<b id="c-MEDIUM"></b></button>
+        <button class="chip" data-l="LOW" aria-pressed="false">Low<b id="c-LOW"></b></button>
+        <div class="searchWrap">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+          <input id="fQuery" type="search" placeholder="Search file / signature  (press /)" aria-label="Search file or signature">
+        </div>
+        <select id="fAi" title="Filter by the AI verdict">
+          <option value="all">AI: all</option>
+          <option value="malicious">AI: malicious</option>
+          <option value="clean">AI: clean</option>
+          <option value="not_reviewed">AI: not reviewed</option>
+          <option value="hide_fp">AI: hide false positives</option>
+        </select>
+        <button id="fReset">Reset</button>
+        <span class="count" id="count"></span>
       </div>
-      <div id="tableWrap" class="tablewrap" tabindex="0">
+      <div class="actionsRow">
+        <button data-act="reveal"><svg class="ico-amber" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path d="M2 6a2 2 0 012-2h5l2 2h5a2 2 0 012 2v6a2 2 0 01-2 2H4a2 2 0 01-2-2V6z"/></svg><span>Show file</span></button>
+        <button data-act="quarantine"><svg class="ico-orange" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"/></svg><span>Quarantine</span></button>
+        <button data-act="delete" class="danger"><svg fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg><span>Delete from disk</span></button>
+        <button id="cleanBtn"><svg class="ico-purple" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z"/></svg><span>Mass cleanup</span></button>
+        <button id="selectAllBtn"><svg class="ico-blue" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg><span>Select all</span></button>
+        <span class="hint">Click · Ctrl/Shift+click · Ctrl+A · ↑↓ to move · right-click for more</span>
+      </div>
+    </div>
+
+    <div class="main">
+      <div class="tablewrap" id="tableWrap" tabindex="0">
         <table>
-          <colgroup><col style="width:80px"><col style="width:62px"><col><col style="width:62px"><col style="width:84px"><col style="width:132px"><col style="width:72px"><col></colgroup>
+          <colgroup><col style="width:34px"><col style="width:84px"><col style="width:56px"><col style="width:220px"><col style="width:56px"><col style="width:72px"><col style="width:128px"><col style="width:60px"><col><col style="width:132px"></colgroup>
           <thead><tr id="thead">
-            <th data-col="level">Level</th><th data-col="score">Score</th><th data-col="file">File</th><th data-col="line">Line</th>
-            <th data-col="size">Size</th><th data-col="date">Date</th><th data-col="delete">Delete</th><th data-col="signature">Signature</th>
+            <th class="chk"><input type="checkbox" id="rowSelAll" title="Select all rows" aria-label="Select all rows"></th>
+            <th data-col="level">Level</th><th class="num" data-col="score">Score</th><th data-col="file">File</th><th class="num" data-col="line">Line</th>
+            <th class="num" data-col="size">Size</th><th data-col="date">Date</th><th data-col="delete">Del</th><th data-col="signature">Signature</th><th id="aiCol">AI</th>
           </tr></thead>
           <tbody id="tbody"></tbody>
         </table>
       </div>
-    </div>
-    <div id="preview" class="hint">Select a row to see the suspicious code snippet.</div>
-    <div class="panel">
-      <div class="row"><h4 style="margin:0">Log</h4><div class="logbtns"><button id="logCopy">Copy log</button><button id="logClear">Clear view</button></div></div>
-      <pre id="log"></pre>
+      <div class="gutter" id="gut" title="Drag to resize · double-click to collapse"></div>
+      <div class="bottom" id="bottom">
+        <div class="btabs">
+          <button class="btab" data-p="det" aria-selected="true">Details</button>
+          <button class="btab" data-p="log" aria-selected="false">Log</button>
+          <button class="btab" data-p="eng" aria-selected="false">Engines</button>
+          <span class="sp"></span>
+          <span class="detQuickPath" id="detQuickPath"></span>
+          <button id="logClear" class="btn" hidden>Clear view</button>
+          <button id="logCopy" class="btn" hidden>Copy log</button>
+          <button id="foldBtn" class="btn" title="Collapse / expand" aria-label="Collapse or expand the bottom panel"><svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z" clip-rule="evenodd"/></svg></button>
+        </div>
+        <div class="pane" id="det"><span class="empty">Select a row to see details.</span></div>
+        <pre class="pane log" id="log" hidden></pre>
+        <div class="pane" id="eng" hidden></div>
+      </div>
     </div>
   </section>
 </main>
-<footer><span id="status">Ready to run</span><span class="spacer"></span>
-  <span class="hint">Bookmark this page: <code id="selfUrl"></code> · v__VERSION__</span></footer>
+<footer class="footer"><span id="status">Ready to run</span><span id="engines" class="engines" title="Engines detected on the site"></span><span class="sp"></span>
+  <span>Bookmark this page:</span><code id="selfUrl"></code><span class="dot">·</span><span class="ver">v__VERSION__</span></footer>
 <div id="ctx"></div>
 <div id="toasts"></div>
 <script>
@@ -1749,11 +3197,12 @@ const $ = (id) => document.getElementById(id);
 const ESC = {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'};
 const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ESC[c]);
 const S = {settings: {}, tab: 'run', logNext: 0, ver: -1, noticeSeq: null, boot: null, sel: new Set(), order: [], last: null,
-           sort: 'score', desc: true, job: null, rows: [], saveTimer: null, online: false, fTimer: null};
+           sort: 'score', desc: true, level: 'ALL', job: null, rows: [], saveTimer: null, online: false, fTimer: null, pvTimer: null, aiStats: null};
 
-async function api(path, body) {
+async function api(path, body, opts) {
   const opt = {headers: {'X-Requested-With': 'scan-backdoors-gui'}};
   if (body !== undefined) { opt.method = 'POST'; opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
+  if (opts && opts.signal) opt.signal = opts.signal;
   const r = await fetch(path, opt);
   let j = {};
   try { j = await r.json(); } catch (e) { /* not JSON */ }
@@ -1788,7 +3237,28 @@ const confirmDlg = (title, text, ok, danger) => modal({title, text, cls: danger 
 const msgDlg = (title, text, kind) => modal({title, text, cls: kind === 'error' ? 'error' : kind === 'warn' ? 'warn' : ''});
 const showErr = (e) => toast(e && e.message ? e.message : String(e), 'error');
 
-// ---------------------------------------------------------------- settings form
+// ────────────────────────────────────────────── theme
+function effectiveTheme() {
+  try {
+    const saved = localStorage.getItem('sb_theme');
+    if (saved === 'light' || saved === 'dark') return saved;
+  } catch (e) { /* no storage */ }
+  return matchMedia('(prefers-color-scheme:light)').matches ? 'light' : 'dark';
+}
+function paintTheme(t) {
+  document.documentElement.dataset.theme = t;
+  document.getElementById('themeLight').classList.toggle('on', t === 'light');
+  document.getElementById('themeLight').setAttribute('aria-pressed', t === 'light' ? 'true' : 'false');
+  document.getElementById('themeDark').classList.toggle('on', t === 'dark');
+  document.getElementById('themeDark').setAttribute('aria-pressed', t === 'dark' ? 'true' : 'false');
+}
+function setTheme(t) {
+  try { localStorage.setItem('sb_theme', t); } catch (e) { /* no storage */ }
+  paintTheme(t);
+}
+function toggleTheme() { setTheme(effectiveTheme() === 'dark' ? 'light' : 'dark'); }
+
+// ────────────────────────────────────────────── settings form
 const PATHS = [['scanner_path', 'Scanner script', 'file'], ['site_dir', 'Site folder', 'dir'], ['baseline_dir', 'Clean Joomla (optional)', 'dir'],
   ['whitelist_path', 'Whitelist (optional)', 'file'], ['csv_path', 'CSV report', 'save'], ['xlsx_path', 'XLSX report (optional)', 'save'],
   ['json_path', 'JSON report (optional)', 'save']];
@@ -1798,6 +3268,9 @@ const OPTS = [['max_size', 'File size, MB'], ['max_matches', 'Max findings/level
 const FLAGS = [['only_critical', 'Critical only'], ['no_warnings', 'No warnings'], ['no_csv', 'Do not create CSV'], ['auto_open', 'Open the CSV after scanning']];
 const CLEAN = [['clean_permanent', 'Delete permanently (no quarantine)'], ['clean_fm', 'Include web file managers (elp.php etc.)'],
   ['clean_core', 'Replace modified core files with originals (needs a clean Joomla of the same version)']];
+const AI_FLAGS = [['ai_enabled', 'Enable AI review (after the scan)']];
+const AI_TEXT = [['ai_base_url', 'Endpoint (e.g. http://127.0.0.1:8080/v1)'],
+  ['ai_model', 'Model (optional - the gateway-loaded model is used when empty)']];
 
 function buildSettings() {
   const grid = $('pathGrid'); grid.innerHTML = '';
@@ -1807,6 +3280,12 @@ function buildSettings() {
     const b = document.createElement('button'); b.textContent = 'Browse…';
     b.addEventListener('click', async () => { const p = await browse(mode, i.value, label); if (p != null) { i.value = p; onSettingChanged(); } });
     grid.append(l, i, b);
+    if (k === 'baseline_dir') {
+      const fb = document.createElement('button'); fb.textContent = 'Fetch baseline';
+      fb.title = 'Detect the Joomla version of the site and download the official clean Full_Package from the joomla/joomla-cms GitHub releases';
+      fb.addEventListener('click', () => fetchBaseline(false));
+      grid.append(fb);
+    }
   });
   const og = $('optGrid'); og.innerHTML = '';
   OPTS.forEach(([k, label]) => {
@@ -1816,7 +3295,12 @@ function buildSettings() {
   const flag = (box, list) => { box.innerHTML = ''; list.forEach(([k, label]) => {
     const l = document.createElement('label'); const c = document.createElement('input'); c.type = 'checkbox'; c.id = 'set_' + k; c.dataset.key = k;
     l.append(c, document.createTextNode(label)); box.appendChild(l); }); };
-  flag($('flagRow'), FLAGS); flag($('cleanRow'), CLEAN);
+  flag($('flagRow'), FLAGS); flag($('cleanRow'), CLEAN); flag($('aiFlagRow'), AI_FLAGS);
+  const aog = $('aiGrid'); aog.innerHTML = '';
+  AI_TEXT.forEach(([k, label]) => {
+    const l = document.createElement('label'); l.textContent = label;
+    const i = document.createElement('input'); i.type = 'text'; i.id = 'set_' + k; i.dataset.key = k; l.appendChild(i); aog.appendChild(l);
+  });
   document.querySelectorAll('[data-key]').forEach((el) => { el.addEventListener('input', onSettingChanged); el.addEventListener('change', onSettingChanged); });
 }
 function fillSettings(s) {
@@ -1828,9 +3312,24 @@ function readSettings() {
   return out;
 }
 function onSettingChanged() { clearTimeout(S.saveTimer); S.saveTimer = setTimeout(saveSettings, 500); }
-async function saveSettings() { clearTimeout(S.saveTimer); S.saveTimer = null; try { await api('/api/settings', {settings: readSettings()}); } catch (e) { showErr(e); } }
+async function saveSettings() { clearTimeout(S.saveTimer); S.saveTimer = null; try { await api('/api/settings', {settings: readSettings()}); S.settings = readSettings(); setBusy(S.job); } catch (e) { showErr(e); } }
+async function fetchBaseline(autoScan) {
+  try {
+    await saveSettings();
+    const d = await api('/api/baseline/detect', {});
+    const yes = await confirmDlg('Download the clean Joomla ' + d.version + ' baseline?',
+      'The site looks like Joomla ' + d.version + '.\n\n' +
+      'The tool will download the official Full_Package from the joomla/joomla-cms GitHub releases over HTTPS, verify it, and unpack it into the joomla-baselines folder next to the scanner. When it finishes, the Clean Joomla folder setting is filled in automatically.\n\n' +
+      'This is the only part of the app that reaches the internet, and only after this confirmation.',
+      'Download');
+    if (!yes) return;
+    const r = await api('/api/baseline/fetch', {version: d.version});
+    if (autoScan) S.autoScanBaseline = true;
+    toast('Downloading the Joomla ' + r.version + ' baseline - progress in the Log tab.', 'ok');
+  } catch (e) { msgDlg('Baseline', e.message, 'error'); }
+}
 
-// ---------------------------------------------------------------- server-side file browser
+// ────────────────────────────────────────────── server-side file browser
 async function browse(mode, start, title) {
   let cur = '', picked = null, data = null;
   const node = document.createElement('div');
@@ -1849,7 +3348,7 @@ async function browse(mode, start, title) {
   const load = async (p) => {
     try { data = await api('/api/fs?mode=' + encodeURIComponent(mode) + '&path=' + encodeURIComponent(p || '')); }
     catch (e) { if (p) return load(''); showErr(e); return; }
-    cur = data.path; pathIn.value = cur; picked = null; list.innerHTML = '';
+    cur = data.path; pathIn.value = cur; picked = null; nameIn.value = ''; list.innerHTML = '';
     data.entries.forEach((en) => {
       const d = document.createElement('div'); const n = document.createElement('span');
       n.textContent = (en.kind === 'dir' ? '📁 ' : '📄 ') + en.name; d.appendChild(n);
@@ -1877,32 +3376,70 @@ async function browse(mode, start, title) {
       return picked; }}]});
 }
 
-// ---------------------------------------------------------------- findings table
+// ────────────────────────────────────────────── findings table
+function aiBadge(r) {
+  const ai = r.ai;
+  if (!ai) return {text: '—', cls: 'ai-none', tip: 'Not reviewed by the AI yet'};
+  const m = {real_threat: ['⚠ threat', 'ai-real'], false_positive: ['✓ false positive', 'ai-fp'],
+             uncertain: ['? uncertain', 'ai-uncertain'], error: ['⚠ error', 'ai-error']};
+  const t = m[ai.status] || ['🤖 ?', 'ai-uncertain'];
+  return {text: t[0], cls: t[1], tip: ai.comment || ''};
+}
 function rowHtml(r) {
-  const cells = [r.level, r.score, r.file, r.line, r.size, r.date, r.delete, r.signature];
-  return '<tr data-id="' + Number(r.id) + '" class="lv-' + esc(r.level) + (S.sel.has(r.id) ? ' sel' : '') + '">' +
-    cells.map((c) => '<td title="' + esc(c) + '">' + esc(c) + '</td>').join('') + '</tr>';
+  const bd = aiBadge(r);
+  return '<tr data-id="' + Number(r.id) + '"' + (S.sel.has(r.id) ? ' class="sel"' : '') + '>' +
+    '<td class="chk"><input type="checkbox" data-chk="' + Number(r.id) + '" tabindex="-1" aria-label="Select row"' + (S.sel.has(r.id) ? ' checked' : '') + '></td>' +
+    '<td><span class="lv ' + esc(r.level) + '">' + esc(r.level) + '</span></td>' +
+    '<td class="num">' + esc(r.score) + '</td>' +
+    '<td title="' + esc(r.file) + '">' + esc(r.file) + '</td>' +
+    '<td class="num">' + esc(r.line) + '</td>' +
+    '<td class="num">' + esc(r.size) + '</td>' +
+    '<td>' + esc(r.date) + '</td>' +
+    '<td>' + esc(r.delete) + '</td>' +
+    '<td title="' + esc(r.signature) + '">' + esc(r.signature) + '</td>' +
+    '<td class="' + bd.cls + '" title="' + esc(bd.tip) + '"><span class="ai-badge">' + esc(bd.text) + '</span></td></tr>';
+}
+function fillChips(counts) {
+  const set = (id, v) => { const el = $(id); if (el) el.textContent = v == null ? '' : v; };
+  set('c-ALL', counts.ALL); set('c-HIGH', counts.HIGH); set('c-MEDIUM', counts.MEDIUM); set('c-LOW', counts.LOW);
 }
 function renderRows(data) {
   S.rows = data.rows; S.order = data.rows.map((r) => r.id);
   const keep = new Set(S.order); S.sel.forEach((id) => { if (!keep.has(id)) S.sel.delete(id); });
-  $('tbody').innerHTML = data.rows.map(rowHtml).join('');
+  const tb = $('tbody');
+  if (!data.rows.length) {
+    tb.innerHTML = '<tr class="empty-row"><td colspan="10">No findings match the current filter.</td></tr>';
+  } else {
+    tb.innerHTML = data.rows.map(rowHtml).join('');
+  }
   let t = 'Showing ' + data.shown + ' of ' + data.total;
   if (data.matched > data.shown) t += ' (table limit ' + data.limit + ', narrow the filter or open the CSV)';
   if (data.hidden_done) t += ' · hidden as handled: ' + data.hidden_done;
+  if (S.sel.size) t += ' · ' + S.sel.size + ' selected';
   $('count').textContent = t;
+  fillChips(data.counts || {});
   document.querySelectorAll('#thead th').forEach((th) => {
     const a = th.querySelector('.arr'); if (a) a.remove();
     if (th.dataset.col === S.sort) { const s = document.createElement('span'); s.className = 'arr'; s.textContent = S.desc ? ' ▼' : ' ▲'; th.appendChild(s); }
   });
-  showPreview();
+  showDetails();
 }
 async function refreshFindings() {
-  const p = new URLSearchParams({level: $('fLevel').value, q: $('fQuery').value, sort: S.sort, desc: S.desc ? '1' : '0'});
-  try { const d = await api('/api/findings?' + p.toString()); S.ver = d.version; renderRows(d); } catch (e) { showErr(e); }
+  const lvl = S.level === 'ALL' ? 'All' : S.level;
+  const p = new URLSearchParams({level: lvl, q: $('fQuery').value, ai: $('fAi').value, sort: S.sort, desc: S.desc ? '1' : '0'});
+  try { const d = await api('/api/findings?' + p.toString()); S.ver = d.version; renderRows(d); renderAiCluster(); } catch (e) { showErr(e); }
+}
+function selectAll() {
+  S.order.forEach((id) => S.sel.add(id));
+  paintSel(); showDetails();
 }
 function paintSel() {
   document.querySelectorAll('#tbody tr').forEach((tr) => tr.classList.toggle('sel', S.sel.has(Number(tr.dataset.id))));
+  document.querySelectorAll('#tbody input[data-chk]').forEach((cb) => { cb.checked = S.sel.has(Number(cb.dataset.chk)); });
+  const ra = $('rowSelAll');
+  if (ra) { const nn = S.order.length; const kk = S.order.filter((id) => S.sel.has(id)).length; ra.checked = nn > 0 && kk === nn; ra.indeterminate = kk > 0 && kk < nn; }
+  const btn = $('selectAllBtn');
+  if (btn) btn.innerHTML = '<svg class="ico-blue" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg><span>' + ((S.order.length && S.sel.size >= S.order.length) ? 'Clear selection' : 'Select all') + '</span>';
 }
 function selectRow(id, ev) {
   if (ev && ev.shiftKey && S.last != null && S.order.includes(S.last)) {
@@ -1910,24 +3447,45 @@ function selectRow(id, ev) {
     if (!(ev.ctrlKey || ev.metaKey)) S.sel.clear(); for (let i = lo; i <= hi; i++) S.sel.add(S.order[i]);
   } else if (ev && (ev.ctrlKey || ev.metaKey)) { if (S.sel.has(id)) S.sel.delete(id); else S.sel.add(id); S.last = id; }
   else { S.sel.clear(); S.sel.add(id); S.last = id; }
-  paintSel(); showPreview();
+  paintSel(); showDetails();
 }
-let pvTimer = null;
-function showPreview() {
-  clearTimeout(pvTimer);
-  pvTimer = setTimeout(async () => {
-    const el = $('preview'); const ids = [...S.sel];
-    if (ids.length === 0) { el.className = 'hint'; el.textContent = 'Select a row to see the suspicious code snippet.'; return; }
-    if (ids.length > 1) { const files = new Set(S.rows.filter((r) => S.sel.has(r.id)).map((r) => r.file)); el.className = ''; el.textContent = 'Rows selected: ' + ids.length + ', files: ' + files.size; return; }
+const AI_BOX_CLS = {'ai-real': ' v-real', 'ai-fp': ' v-fp', 'ai-uncertain': ' v-uncertain', 'ai-error': ' v-error', 'ai-none': ''};
+function showDetails() {
+  clearTimeout(S.pvTimer);
+  S.pvTimer = setTimeout(async () => {
+    const el = $('det'); const ids = [...S.sel];
+    const qp = document.getElementById('detQuickPath');
+    if (!ids.length) {
+      el.innerHTML = '<span class="empty">Select a row to see details.</span>';
+      if (qp) qp.textContent = '';
+      return;
+    }
+    const files = new Set(S.rows.filter((r) => S.sel.has(r.id)).map((r) => r.file));
+    let note = '';
+    if (ids.length > 1) note = '<div class="multi">Rows selected: ' + ids.length + ' · files: ' + files.size + '</div>';
     try {
-      const d = await api('/api/finding?id=' + ids[0]); el.className = '';
-      el.textContent = 'File: ' + d.file + '\nLevel: ' + d.level + ' | Score: ' + d.score + ' | Line: ' + d.line + ' | Size: ' + d.size + ' | Date: ' + d.date +
-        '\nSignature: ' + d.signature + (d.sha256 ? '\nSHA-256: ' + d.sha256 : '') + '\n' + '-'.repeat(72) + '\n' + (d.snippet || '(The snippet is not stored in the CSV.)');
-    } catch (e) { el.textContent = ''; }
+      const d = await api('/api/finding?id=' + ids[ids.length - 1]);
+      const bd = aiBadge({ai: d.ai});
+      const snippet = d.snippet || '';
+      const aiText = d.ai ? (d.ai.comment || 'No comment.') : 'Not reviewed by the AI yet.';
+      el.innerHTML = note +
+        '<div class="detWrap">' +
+          '<div class="detMeta">' +
+            '<div class="detPath"><div class="detPathTop"><span class="detLabel">Full file path</span><div class="detPathVal">' + esc(d.file).replace(/[\\/]/g, function (m) { return m + '<wbr>'; }) + '</div></div><button type="button" class="detCopyBtn" data-det="copyPath" title="Copy full path">Copy</button></div>' +
+            '<div class="detGrid">' +
+              '<div class="detCard"><span class="detLabel">SHA-256 digest</span><div class="detVal">' + esc(d.sha256 || '—') + '</div></div>' +
+              '<div class="detCard"><span class="detLabel">Signature rule</span><div class="detVal detSig">' + esc(d.signature || '—') + '</div></div>' +
+            '</div>' +
+            '<div class="detAiBox' + (AI_BOX_CLS[bd.cls] || '') + '"><div class="detAiHead"><span class="detLabel">AI heuristic verdict</span><span class="ai-badge ' + bd.cls + '">' + esc(bd.text) + '</span></div><p class="detAiReason">' + esc(aiText) + '</p></div>' +
+          '</div>' +
+          '<div class="detCode"><div class="detCodeHead"><span>Source snippet</span><span class="detCodeFile">' + esc(d.file || '') + '</span></div><pre class="detCodeBody">' + (snippet ? esc(snippet) : 'No snippet stored.') + '</pre></div>' +
+        '</div>';
+      if (qp) qp.textContent = d.file || '';
+    } catch (e) { /* row may have left the report */ }
   }, 80);
 }
 
-// ---------------------------------------------------------------- actions on files
+// ────────────────────────────────────────────── actions on files
 async function saveFromServer() { const s = await api('/api/settings'); S.settings = s.settings; fillSettings(s.settings); }
 async function copyText(t) {
   try { await navigator.clipboard.writeText(t); return; } catch (e) { /* fall back */ }
@@ -1961,13 +3519,48 @@ async function fileAction(act) {
   } catch (e) { showErr(e); }
 }
 
-// ---------------------------------------------------------------- state polling
+// ────────────────────────────────────────────── state polling
+function renderAiCluster() {
+  // The run-bar AI cluster: threats/errors counter, candidates count, FP button.
+  // The counter is shown only after a review completes (and not while a job runs).
+  const stats = S.aiStats;
+  const job = S.job;
+  const aiOn = !!S.settings.ai_enabled;
+  const chip = $('aiStats');
+  const real = stats ? stats.real_threat : 0;
+  const errors = stats ? stats.error : 0;
+  const fp = stats ? stats.false_positive : 0;
+  const cands = stats ? stats.candidates : 0;
+  const showChip = !!(stats && stats.reviewed > 0 && !job && aiOn);
+  chip.hidden = !showChip;
+  if (showChip) chip.innerHTML = '🤖 threats: <b>' + real + '</b> &middot; &#9888; errors: <b>' + errors + '</b>';
+  const showCount = aiOn && stats && stats.reviewed > 0;
+  $('candBtn').innerHTML = '<svg class="cbtn-ico" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M19.428 15.428a2 2 0 00-1.022-.547l-2.387-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a2 2 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A2 2 0 009 10.172V5L8 4z"/></svg><span>Candidates</span>' + (showCount && cands > 0 ? '<span class="cbadge">' + cands + '</span>' : '');
+  $('candBtn').disabled = !!job || !aiOn;
+  $('fpBtn').innerHTML = '<span>🧹</span><span>Remove false positives</span>' + (showCount && fp > 0 ? '<span class="cbadge">' + fp + '</span>' : '');
+  $('fpBtn').disabled = !!job || !aiOn || fp === 0;
+  $('fpBtn').title = fp > 0 && !job && aiOn
+    ? 'Remove the ' + fp + ' false positive(s) the AI flagged - they are hidden from the list (they stay in the CSV)'
+    : 'No false positives to remove';
+}
 function setBusy(job) {
   S.job = job;
-  $('startBtn').disabled = !!job; $('cleanBtn').disabled = !!job; $('stopBtn').disabled = !job || !!(job && job.stopping);
-  const bar = $('bar');
-  if (job) { bar.classList.toggle('indet', !!job.indeterminate); $('barFill').style.width = job.indeterminate ? '' : job.percent + '%'; $('progText').textContent = job.text; }
-  else { bar.classList.remove('indet'); $('barFill').style.width = '0'; }
+  $('startBtn').disabled = !!job;
+  $('stopBtn').disabled = !job || !!(job && job.stopping);
+  $('cleanBtn').disabled = !!job;
+  const aiOn = !!S.settings.ai_enabled;
+  $('aiBtn').disabled = !!job || !aiOn;
+  $('aiHint').textContent = aiOn ? '' : 'Enable AI review in the Settings tab first.';
+  const prog = $('prog');
+  if (job) {
+    prog.classList.toggle('indet', !!job.indeterminate);
+    $('progFill').style.width = job.indeterminate ? '' : job.percent + '%';
+    if (!job.indeterminate) prog.setAttribute('aria-valuenow', job.percent);
+    $('progText').textContent = job.text;
+  } else {
+    prog.classList.remove('indet');
+    $('progFill').style.width = '0';
+  }
 }
 function appendLog(lines) {
   if (!lines.length) return; const el = $('log'); const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
@@ -1975,8 +3568,23 @@ function appendLog(lines) {
   if (el.textContent.length > 600000) el.textContent = el.textContent.slice(-400000);
   if (atBottom) el.scrollTop = el.scrollHeight;
 }
+function showBusy(text) {
+  const ov = document.createElement('div'); ov.className = 'overlay';
+  const dlg = document.createElement('div'); dlg.className = 'dlg';
+  const h = document.createElement('h3'); h.textContent = 'Signature library';
+  const body = document.createElement('div'); body.className = 'body'; body.textContent = text;
+  const btns = document.createElement('div'); btns.className = 'btns';
+  const b = document.createElement('button'); b.textContent = 'Cancel';
+  btns.appendChild(b); dlg.append(h, body, btns); ov.appendChild(dlg); document.body.appendChild(ov);
+  return {close: () => ov.remove(), onCancel: (fn) => b.addEventListener('click', () => { fn(); })};
+}
+
 async function onNotice(n) {
   try {
+    if (n.kind === 'info' && n.title === 'AI review') {
+      await aiReviewFlow(n);
+      return;
+    }
     if (n.kind === 'offer_csv') { if (await confirmDlg(n.title, n.text, 'Open CSV')) await api('/api/report/open', {kind: 'csv'}); }
     else if (n.kind === 'clean_plan') {
       const go = await confirmDlg(n.title, n.text, n.permanent ? 'Delete permanently' : 'Move to quarantine', true);
@@ -1984,85 +3592,343 @@ async function onNotice(n) {
     } else await msgDlg(n.title, n.text, n.kind);
   } catch (e) { showErr(e); }
 }
+
+// ────────────────────────────────────────────── AI review post-flow
+async function aiReviewFlow(n) {
+  await msgDlg(n.title, n.text, n.kind);          // the review summary (existing behaviour)
+  // (a) false positives -> offer to remove them from the threat list (they stay in the CSV)
+  if (n.ai_fp > 0) {
+    const yes = await confirmDlg('Remove false positives from the threat list?',
+      'The AI review marked ' + n.ai_fp + ' file(s) as false positive.\n\n' +
+      'Remove them from the threat list?\nThe rows stay in the CSV - they are only hidden from the list.',
+      'Remove from list', false);
+    if (yes) {
+      try {
+        const r = await api('/api/ai/review/remove_false_positives', {});
+        toast(r.text, 'ok');
+        await refreshFindings();
+      } catch (e) { showErr(e); }
+    }
+  }
+  // (b) real threats -> offer an AI-prepared signature per file (never applied without confirmation)
+  if (n.ai_real > 0 && !n.ai_stopped) {
+    await aiSignaturesFlow();
+  }
+}
+
+async function aiSignaturesFlow() {
+  const ctrl = new AbortController();
+  const busy = showBusy('The AI is preparing signatures from the real threats...\nThis can take a moment.');
+  let cancelled = false;
+  busy.onCancel(() => { cancelled = true; ctrl.abort(); });
+  let d = null;
+  try {
+    d = await api('/api/ai/signatures/prepare', {}, {signal: ctrl.signal});
+  } catch (e) {
+    busy.close();
+    if (!cancelled && !(e && e.name === 'AbortError')) showErr(e);
+    return;
+  }
+  busy.close();
+  if (cancelled) return;
+  if (!d.proposals || !d.proposals.length) {
+    const problems = (d.problems || []).slice(0, 6);
+    if (problems.length) {
+      const lines = ['The AI did not prepare any signatures:', ''];
+      problems.forEach((p) => lines.push('  • ' + (p.file || '') + ': ' + (p.reason || '')));
+      await msgDlg('Signature library', lines.join('\n'), 'warn');
+    }
+    return;
+  }
+  const lines = ['The AI prepared ' + d.proposals.length + ' signature(s) from the real threats:', ''];
+  d.proposals.forEach((p, i) => {
+    lines.push('#' + (i + 1) + '  ' + p.label + '  [' + p.severity + ']  kinds: ' + p.kinds);
+    lines.push('   pattern: ' + p.pattern);
+    if (p.weight) lines.push('   weight: ' + p.weight);
+    lines.push('   file: ' + p.file + (p.line ? '  (line ' + p.line + ')' : ''));
+    if (p.reason) lines.push('   reason: ' + p.reason);
+    lines.push('');
+  });
+  lines.push('Nothing is written automatically: the library is a separate JSON file that the');
+  lines.push('scanner reads on the next scan (--user-signatures). Review the proposals.');
+  const ok = await modal({title: 'Add AI-prepared signatures to the library?', text: lines.join('\n'), wide: true, buttons: [
+    {text: 'Cancel', value: false},
+    {text: 'Add to library', value: true, cls: 'primary'}]});
+  if (!ok) return;
+  try {
+    const r = await api('/api/ai/signatures/apply', {signatures: d.proposals});
+    let text = r.text;
+    if (r.problems && r.problems.length) {
+      text += '\nSkipped: ' + r.problems.map((p) => (p.label || '(no label)') + ' - ' + p.reason).join('; ');
+    }
+    toast(text, 'ok');
+  } catch (e) { showErr(e); }
+}
+function paintEngines(st) {
+  const list = st.engines || [], base = st.baseline || {};
+  const sig = JSON.stringify([list, base]);
+  if (sig === S.engSig) return; S.engSig = sig;
+  if (!list.length) { $('eng').innerHTML = '<span class="empty">No engines detected on the site. Choose the Site folder on the Settings tab.</span>'; return; }
+  let rows = '';
+  list.forEach((e) => {
+    let org;
+    if (e.name !== 'Joomla') org = '<span class="engNo" title="third-party originals are not downloaded by the app">not downloaded</span>';
+    else if (base.dir && base.match) org = '<span class="engYes">\u2713 loaded</span><div class="engDir">' + esc(base.dir) + '</div>';
+    else if (base.dir) org = '<span class="engBad">\u2717 folder holds ' + esc(base.version || 'an unrecognized Joomla version') + '</span><div class="engDir">' + esc(base.dir) + '</div>';
+    else org = '<span class="engNo">not downloaded</span>';
+    rows += '<tr><td class="engName">' + esc(e.name) + '</td><td class="engVer">' + esc(e.version) + '</td><td>' + org + '</td></tr>';
+  });
+  const bar = '<div class="engBar"><span>The originals below are downloaded freely from the publishers; the app can fetch the Joomla core.</span>'
+    + (base.joomla ? '<button class="btn" id="engFetch">Fetch Joomla ' + esc(base.joomla) + ' baseline</button>' : '') + '</div>';
+  $('eng').innerHTML = bar + '<table class="engTbl"><tr><th>Engine</th><th>Version</th><th>Original</th></tr>' + rows + '</table>';
+  const fb = $('engFetch');
+  if (fb) fb.addEventListener('click', () => fetchBaseline(false));
+}
+async function startScan(noBaseline) {
+  await api('/api/scan/start', noBaseline ? {settings: readSettings(), no_baseline: true} : {settings: readSettings()});
+  $('log').textContent = ''; S.logNext = 0; S.sel.clear(); toast('Scan started' + (noBaseline ? ' (no baseline)' : ''), 'ok');
+}
 async function poll() {
   let delay = 1500;
   try {
     const st = await api('/api/state?since=' + S.logNext);
-    if (!S.online) { S.online = true; $('conn').textContent = 'connected'; $('conn').className = 'pill'; }
+    if (!S.online) { S.online = true; $('conn').textContent = 'connected'; $('conn').className = 'badge'; }
     if (S.boot !== null && S.boot !== st.boot) { S.logNext = 0; $('log').textContent = ''; await saveFromServer(); }
     S.boot = st.boot;
     if (st.log.from > S.logNext && S.logNext !== 0) $('log').textContent += '… (older lines were dropped)\n';
     appendLog(st.log.lines); S.logNext = st.log.next;
+    const prevJob = S.job;
     setBusy(st.job);
+    if (prevJob && prevJob.kind === 'baseline' && !st.job) await saveFromServer();
+    S.aiStats = st.ai_stats || null;
+    renderAiCluster();
     if (!st.job) $('progText').textContent = st.idle_text || '';
     $('status').textContent = st.status;
-    ['csv', 'xlsx', 'json'].forEach((k) => { const b = document.querySelector('[data-rep="' + k + '"]'); if (b) b.disabled = !st.reports[k].exists; });
+    $('engines').textContent = (st.engines || []).map((e) => e.name + ' ' + e.version).join('  \u00b7  ');
+    paintEngines(st);
+    if (S.autoScanBaseline && !st.job && (st.status || '').indexOf('Baseline ready') === 0 && st.status !== S.lastStatus) {
+      S.autoScanBaseline = false;               // the fetch may be over before a poll ever saw the job: key off the status
+      await saveFromServer();
+      try { await startScan(false); } catch (e) { showErr(e); }
+    }
+    S.lastStatus = st.status;
+    ['csv', 'xlsx', 'json'].forEach((k) => {
+      const exists = st.reports[k].exists;
+      const b = document.querySelector('[data-rep="' + k + '"]'); if (b) b.disabled = !exists;
+      const l = document.querySelector('[data-dl="' + k + '"]'); if (l) l.setAttribute('aria-disabled', exists ? 'false' : 'true');
+    });
     if (st.findings_version !== S.ver) await refreshFindings();
     if (S.noticeSeq === null) S.noticeSeq = st.notice ? st.notice.seq : 0;       // do not replay old dialogs after a reload
     else if (st.notice && st.notice.seq !== S.noticeSeq) { S.noticeSeq = st.notice.seq; onNotice(st.notice); }
     delay = st.job ? 500 : 1500;
   } catch (e) {
-    if (S.online) { S.online = false; $('conn').textContent = 'server not reachable'; $('conn').className = 'pill off'; }
+    if (S.online) { S.online = false; $('conn').textContent = 'server not reachable'; $('conn').className = 'badge off'; }
     delay = 2000;
   }
   setTimeout(poll, document.hidden ? Math.max(delay, 2500) : delay);
 }
 
-// ---------------------------------------------------------------- tabs and wiring
+// ────────────────────────────────────────────── AI review
+async function showCandidates() {
+  try {
+    const d = await api('/api/ai/candidates', {});
+    const lines = ['Files with real threats: ' + d.files, ''];
+    d.candidates.forEach((c, i) => {
+      lines.push('#' + (i + 1) + '  ' + c.signature + '  (score ' + c.score + ', ' + c.count + ' finding(s), ' + c.files.length + ' file(s))');
+      if (c.severity) lines.push('   severity: ' + c.severity);
+      c.files.slice(0, 5).forEach((f) => lines.push('   - ' + f));
+      if (c.examples.length) {
+        lines.push('   examples:');
+        c.examples.slice(0, 2).forEach((ex) => lines.push('     ' + ex.file + ':' + ex.line + '  ' + String(ex.snippet || '').slice(0, 160)));
+      }
+      lines.push('');
+    });
+    lines.push('These are candidates for the signature library - review them and add only the confirmed ones to the scanner (the scanner is not modified automatically).');
+    const text = lines.join('\n');
+    await modal({title: 'Candidates for the signature library', text, wide: true, buttons: [
+      {text: 'Copy', value: () => { try { navigator.clipboard.writeText(text); } catch (e) {} return true; }},
+      {text: 'Close', value: false}]});
+  } catch (e) { showErr(e); }
+}
+
+// ────────────────────────────────────────────── tabs / panel / menu
 function showTab(t) {
   S.tab = t; location.hash = t;
   document.querySelectorAll('.tab').forEach((el) => el.classList.toggle('active', el.id === 'tab-' + t));
-  document.querySelectorAll('.tabbtn').forEach((b) => b.classList.toggle('active', b.dataset.tab === t));
+  document.querySelectorAll('.toptab').forEach((b) => b.setAttribute('aria-selected', b.dataset.tab === t ? 'true' : 'false'));
 }
+function showPanel(p) {
+  document.querySelectorAll('[data-p]').forEach((x) => x.setAttribute('aria-selected', x.dataset.p === p ? 'true' : 'false'));
+  $('det').hidden = p !== 'det';
+  $('log').hidden = p !== 'log';
+  $('eng').hidden = p !== 'eng';
+  $('logCopy').hidden = p !== 'log';
+  $('logClear').hidden = p !== 'log';
+  $('bottom').classList.remove('collapsed');
+}
+function closeReports() { const m = $('repMenu'); m.classList.remove('open'); $('repBtn').setAttribute('aria-expanded', 'false'); }
 function showCtx(x, y) {
   const m = $('ctx');
   m.innerHTML = [['reveal', '📁 Show file'], ['copyPath', '📋 Copy path'], ['copySha', '📋 Copy SHA-256'], ['whitelist', '✅ To whitelist (false positive)'], ['-'],
     ['quarantine', '📦 Move to quarantine'], ['delete', '🗑 Delete from disk']].map((a) => a[0] === '-' ? '<hr>' : '<div data-a="' + a[0] + '">' + esc(a[1]) + '</div>').join('');
   m.style.display = 'block'; m.style.left = Math.max(0, Math.min(x, innerWidth - 250)) + 'px'; m.style.top = Math.max(0, Math.min(y, innerHeight - 230)) + 'px';
 }
+function onKey(e) {
+  const t = document.activeElement && document.activeElement.tagName;
+  const typing = t === 'INPUT' || t === 'TEXTAREA' || t === 'SELECT';
+  if (e.key === '/' && !typing) { e.preventDefault(); $('fQuery').focus(); $('fQuery').select(); return; }
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a' && !typing) { e.preventDefault(); selectAll(); return; }
+  if (e.key === 'Escape') {
+    closeReports(); $('ctx').style.display = 'none';
+    if (!typing) { S.sel.clear(); paintSel(); showDetails(); }
+    return;
+  }
+  if (e.key === 'Delete' && !typing) { e.preventDefault(); fileAction('delete'); return; }
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    if (typing) return;
+    e.preventDefault(); if (!S.order.length) return;
+    let i = S.last != null ? S.order.indexOf(S.last) : -1;
+    i = e.key === 'ArrowDown' ? Math.min(i + 1, S.order.length - 1) : Math.max(i - 1, 0);
+    if (i < 0 || i >= S.order.length) i = 0;
+    selectRow(S.order[i], e.shiftKey ? {shiftKey: true} : null);
+    const tr = document.querySelector('#tbody tr[data-id="' + S.order[i] + '"]'); if (tr && tr.scrollIntoView) tr.scrollIntoView({block: 'nearest'});
+  }
+}
 async function init() {
   buildSettings();
+  $('det').addEventListener('click', (e) => { const b = e.target.closest('[data-det]'); if (b && b.dataset.det === 'copyPath') fileAction('copyPath'); });
+  paintTheme(effectiveTheme());
+  document.getElementById('themeLight').addEventListener('click', () => setTheme('light'));
+  document.getElementById('themeDark').addEventListener('click', () => setTheme('dark'));
   $('selfUrl').textContent = location.origin + '/';
-  document.querySelectorAll('.tabbtn').forEach((b) => b.addEventListener('click', () => showTab(b.dataset.tab)));
+  document.querySelectorAll('.toptab').forEach((b) => b.addEventListener('click', () => showTab(b.dataset.tab)));
   $('goRun').addEventListener('click', async () => { await saveSettings(); showTab('run'); });
   $('startBtn').addEventListener('click', async () => {
-    try { await saveSettings(); await api('/api/scan/start', {settings: readSettings()}); $('log').textContent = ''; S.logNext = 0; S.sel.clear(); toast('Scan started', 'ok'); }
+    try {
+      await saveSettings();
+      let pf = null;
+      try { pf = await api('/api/preflight', {}); } catch (e) { pf = null; }
+      if (pf && (pf.mode === 'mismatch' || pf.mode === 'no_baseline')) {
+        const jv = pf.joomla || '?';
+        const bv = pf.baseline && pf.baseline.version;
+        const head = pf.mode === 'mismatch'
+          ? 'The site runs Joomla ' + jv + ', but the Clean Joomla folder holds ' + (bv ? 'Joomla ' + bv : 'an unrecognized Joomla version') + '.\n\nScanning with a baseline of the wrong version hides real findings and invents false ones.'
+          : 'No Clean Joomla folder is set, so core files cannot be compared with originals - heuristics alone will report more noise.';
+        const m = await modal({ title: pf.mode === 'mismatch' ? 'Baseline version mismatch' : 'Scan without originals?', text: head, buttons: [
+          { text: 'Cancel', value: 'cancel' },
+          { text: 'Scan without baseline', value: 'nobase' },
+          { text: 'Fetch Joomla ' + jv + ' first', value: 'fetch', cls: 'primary' }
+        ] });
+        if (!m || m === 'cancel') return;
+        if (m === 'fetch') { await fetchBaseline(true); return; }
+        await startScan(true);
+      } else {
+        await startScan(false);
+      }
+    }
     catch (e) { msgDlg('Parameters not filled in', e.message, 'error'); }
   });
   $('stopBtn').addEventListener('click', () => api('/api/job/stop', {}).catch(showErr));
   $('cleanBtn').addEventListener('click', async () => { try { await saveSettings(); await api('/api/clean/plan', {settings: readSettings()}); } catch (e) { msgDlg('Mass cleanup', e.message, 'error'); } });
-  document.querySelectorAll('[data-rep]').forEach((b) => b.addEventListener('click', () => api('/api/report/open', {kind: b.dataset.rep}).catch(showErr)));
-  $('repFolder').addEventListener('click', () => api('/api/report/folder', {}).catch(showErr));
+  $('selectAllBtn').addEventListener('click', () => {
+    if (S.order.length && S.sel.size >= S.order.length) { S.sel.clear(); paintSel(); showDetails(); }
+    else selectAll();
+  });
+  document.querySelectorAll('[data-rep]').forEach((b) => b.addEventListener('click', () => { closeReports(); api('/api/report/open', {kind: b.dataset.rep}).catch(showErr); }));
+  $('repFolder').addEventListener('click', () => { closeReports(); api('/api/report/folder', {}).catch(showErr); });
+  $('repBtn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    const m = $('repMenu'); const open = m.classList.toggle('open');
+    $('repBtn').setAttribute('aria-expanded', open ? 'true' : 'false');
+  });
+  document.querySelectorAll('[data-dl]').forEach((a) => a.addEventListener('click', (e) => {
+    if (a.getAttribute('aria-disabled') === 'true') { e.preventDefault(); return; } closeReports();
+  }));
   document.querySelectorAll('[data-act]').forEach((b) => b.addEventListener('click', () => fileAction(b.dataset.act)));
-  $('fLevel').addEventListener('change', refreshFindings);
+  document.querySelectorAll('.chip').forEach((c) => c.addEventListener('click', () => {
+    S.level = c.dataset.l;
+    document.querySelectorAll('.chip').forEach((x) => x.setAttribute('aria-pressed', x === c ? 'true' : 'false'));
+    refreshFindings();
+  }));
   $('fQuery').addEventListener('input', () => { clearTimeout(S.fTimer); S.fTimer = setTimeout(refreshFindings, 250); });
-  $('fReset').addEventListener('click', () => { $('fLevel').value = 'All'; $('fQuery').value = ''; refreshFindings(); });
+  $('fAi').addEventListener('change', refreshFindings);
+  $('fReset').addEventListener('click', () => {
+    $('fQuery').value = ''; S.level = 'ALL'; $('fAi').value = 'all';
+    document.querySelectorAll('.chip').forEach((x) => x.setAttribute('aria-pressed', x.dataset.l === 'ALL' ? 'true' : 'false'));
+    refreshFindings();
+  });
+  $('aiBtn').addEventListener('click', async () => {
+    try { await saveSettings(); const files = [...new Set(S.rows.filter((x) => S.sel.has(x.id)).map((x) => x.file))];
+      const r = await api('/api/ai/review', files.length ? {files: files} : {});
+      toast('AI review started: ' + r.files + ' file(s)' + (files.length ? ' from the selection' : ''), 'ok'); }
+    catch (e) { msgDlg('AI review', e.message, 'error'); }
+  });
+  $('candBtn').addEventListener('click', () => showCandidates());
+  $('fpBtn').addEventListener('click', async () => {
+    const fp = S.aiStats ? S.aiStats.false_positive : 0;
+    if (!fp) return;
+    const yes = await confirmDlg('Remove false positives from the threat list?',
+      'The AI review marked ' + fp + ' file(s) as false positive.\n\n' +
+      'Remove them from the threat list?\nThe rows stay in the CSV - they are only hidden from the list.',
+      'Remove from list', false);
+    if (!yes) return;
+    try {
+      const r = await api('/api/ai/review/remove_false_positives', {});
+      toast(r.text, 'ok');
+      if (S.aiStats) {
+        S.aiStats = Object.assign({}, S.aiStats, {false_positive: 0, reviewed: Math.max(0, S.aiStats.reviewed - fp)});
+      }
+      renderAiCluster();
+      await refreshFindings();
+    } catch (e) { showErr(e); }
+  });
   $('thead').addEventListener('click', (e) => {
-    const th = e.target.closest('th'); if (!th) return; const c = th.dataset.col;
+    const th = e.target.closest('th'); if (!th) return; const c = th.dataset.col; if (!c) return;
     if (S.sort === c) S.desc = !S.desc; else { S.sort = c; S.desc = (c === 'score'); } refreshFindings();
   });
   const tb = $('tbody');
-  tb.addEventListener('click', (e) => { const tr = e.target.closest('tr'); if (tr) selectRow(Number(tr.dataset.id), e); });
-  tb.addEventListener('dblclick', (e) => { const tr = e.target.closest('tr'); if (tr) { S.sel.clear(); S.sel.add(Number(tr.dataset.id)); paintSel(); fileAction('reveal'); } });
+  tb.addEventListener('click', (e) => { if (e.target.matches('input[data-chk]')) return; const tr = e.target.closest('tr'); if (tr) selectRow(Number(tr.dataset.id), e); });
+  tb.addEventListener('change', (e) => { const cb = e.target.closest('input[data-chk]'); if (!cb) return; const id = Number(cb.dataset.chk); if (cb.checked) S.sel.add(id); else S.sel.delete(id); S.last = id; paintSel(); showDetails(); });
+  const _ra = $('rowSelAll');
+  if (_ra) _ra.addEventListener('change', () => { if (_ra.checked) selectAll(); else { S.sel.clear(); paintSel(); showDetails(); } });
+  tb.addEventListener('dblclick', (e) => { const tr = e.target.closest('tr'); if (tr) { S.sel.clear(); S.sel.add(Number(tr.dataset.id)); paintSel(); showDetails(); fileAction('reveal'); } });
   tb.addEventListener('contextmenu', (e) => {
     const tr = e.target.closest('tr'); if (!tr) return; e.preventDefault(); const id = Number(tr.dataset.id);
     if (!S.sel.has(id)) selectRow(id, null); showCtx(e.clientX, e.clientY);
   });
   $('ctx').addEventListener('click', (e) => { const d = e.target.closest('[data-a]'); $('ctx').style.display = 'none'; if (d) fileAction(d.dataset.a); });
-  document.addEventListener('click', (e) => { if (!e.target.closest('#ctx')) $('ctx').style.display = 'none'; });
+  document.addEventListener('click', (e) => { if (!e.target.closest('#ctx')) $('ctx').style.display = 'none'; if (!e.target.closest('#repMenu')) closeReports(); });
   document.addEventListener('scroll', () => { $('ctx').style.display = 'none'; }, true);
-  $('tableWrap').addEventListener('keydown', (e) => {
-    if (e.key === 'Delete') { e.preventDefault(); fileAction('delete'); }
-    else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a') { e.preventDefault(); S.order.forEach((id) => S.sel.add(id)); paintSel(); showPreview(); }
-    else if (e.key === 'Escape') { S.sel.clear(); paintSel(); showPreview(); }
-    else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
-      e.preventDefault(); if (!S.order.length) return; let i = S.last != null ? S.order.indexOf(S.last) : -1;
-      i = e.key === 'ArrowDown' ? Math.min(i + 1, S.order.length - 1) : Math.max(i - 1, 0); selectRow(S.order[i], e.shiftKey ? {shiftKey: true} : null);
-      const tr = document.querySelector('#tbody tr[data-id="' + S.order[i] + '"]'); if (tr && tr.scrollIntoView) tr.scrollIntoView({block: 'nearest'});
-    }
-  });
+  document.addEventListener('keydown', onKey);
+  // bottom panel
+  document.querySelectorAll('[data-p]').forEach((t) => t.addEventListener('click', () => showPanel(t.dataset.p)));
   $('logCopy').addEventListener('click', async () => { await copyText($('log').textContent); toast('Log copied', 'ok'); });
   $('logClear').addEventListener('click', () => { $('log').textContent = ''; });
+  $('foldBtn').addEventListener('click', () => $('bottom').classList.toggle('collapsed'));
+  const gut = $('gut'), bottom = $('bottom');
+  const wideMQ = matchMedia('(min-width: 1100px)');
+  const clearInline= () => { if (wideMQ.matches) { bottom.style.height = ''; bottom.style.width = ''; } };
+  if (wideMQ.addEventListener) wideMQ.addEventListener('change', clearInline);
+  gut.addEventListener('pointerdown', (e) => {
+    e.preventDefault(); gut.classList.add('drag');
+    const x0 = e.clientX, y0 = e.clientY, w0 = bottom.offsetWidth, h0 = bottom.offsetHeight;
+    const wide = wideMQ.matches;
+    gut.setPointerCapture(e.pointerId);
+    const move = (m) => {
+      if (wide) {
+        bottom.style.width = Math.max(220, Math.min(Math.round(innerWidth * 0.55), w0 - (m.clientX - x0))) + 'px';
+        bottom.style.height = '';
+      } else {
+        bottom.style.height = Math.max(60, Math.min(Math.round(innerHeight * 0.7), h0 + (y0 - m.clientY))) + 'px';
+      }
+      bottom.classList.remove('collapsed');
+    };
+    const up = () => { gut.classList.remove('drag'); gut.removeEventListener('pointermove', move); gut.removeEventListener('pointerup', up); gut.removeEventListener('pointercancel', up); };
+    gut.addEventListener('pointermove', move);
+    gut.addEventListener('pointerup', up);
+    gut.addEventListener('pointercancel', up);
+  });
+  gut.addEventListener('dblclick', () => { if (!wideMQ.matches) bottom.classList.toggle('collapsed'); });
   $('quitBtn').addEventListener('click', async () => {
     if (!(await confirmDlg('Quit', 'Stop the local server? A running scan will be stopped. To use the GUI again start scan_backdoors_gui.py (or start.bat).', 'Quit server', true))) return;
     try { await api('/api/shutdown', {}); } catch (e) { /* the server is going away */ }
@@ -2075,7 +3941,7 @@ async function init() {
   } catch (e) { showTab('run'); }
   poll();
 }
-window.__sbg = {esc, rowHtml, renderRows, selectRow, fileAction, S, init, onNotice, browse};
+window.__sbg = {esc, rowHtml, renderRows, selectRow, fileAction, S, init, onNotice, browse, showDetails};
 document.addEventListener('DOMContentLoaded', init);
 })();
 </script>

@@ -9,6 +9,7 @@ synthetic site, so it works without a real Joomla installation.
 import json
 import os
 import sys
+import time
 import unittest
 from pathlib import Path
 
@@ -114,6 +115,174 @@ class ScanTest(unittest.TestCase):
         status = state.get("status") or ""
         self.assertIn("no critical findings", status,
                       "a clean site must not be reported as critical: %s" % status)
+
+
+class BaselineFetchTest(unittest.TestCase):
+    """The 'Fetch baseline' flow: version detection from the site's own files, and the
+    fetch job wiring. The job itself is exercised with a stub joomla_baseline.py so the
+    test never touches the network."""
+
+    @staticmethod
+    def _fake_site(home):
+        site = os.path.join(home, "site")
+        ver = os.path.join(site, "libraries", "cms", "version")
+        os.makedirs(ver)
+        with open(os.path.join(ver, "version.php"), "w", encoding="utf-8") as f:
+            f.write("<?php class JVersion { public $RELEASE = '3.10'; public $DEV_LEVEL = '12'; }\n")
+        return site
+
+    def test_detect_reports_the_site_version(self):
+        home = h.workdir("sbd-gui-")
+        site = self._fake_site(home)
+        with h.Gui(home) as gui:
+            gui.api("POST", "/api/settings", {"settings": {"site_dir": site}})
+            d = gui.api("POST", "/api/baseline/detect", {})
+            self.assertEqual(d["version"], "3.10.12")
+
+    def test_detect_refuses_without_a_site(self):
+        home = h.workdir("sbd-gui-")
+        with h.Gui(home) as gui:
+            with self.assertRaises(h.ApiError):
+                gui.api("POST", "/api/baseline/detect", {})
+
+    def test_fetch_job_fills_the_baseline_dir_setting(self):
+        home = h.workdir("sbd-gui-")
+        site = self._fake_site(home)
+        tools = os.path.join(home, "tools")
+        os.makedirs(tools)
+        stub = os.path.join(tools, "scan_backdoors.py")
+        with open(stub, "w", encoding="utf-8") as f:
+            f.write("# stub scanner - only the folder location matters here\n")
+        fetcher = os.path.join(tools, "joomla_baseline.py")
+        with open(fetcher, "w", encoding="utf-8") as f:
+            f.write("import pathlib, sys\n"
+                    "a = sys.argv[1:]\n"
+                    "out = pathlib.Path(a[a.index('--out') + 1])\n"
+                    "d = out / ('Joomla_' + a[0])\n"
+                    "(d / 'libraries').mkdir(parents=True)\n"
+                    "(d / 'index.php').write_text('<?php // stub baseline\\n')\n")
+        with h.Gui(home) as gui:
+            gui.api("POST", "/api/settings", {"settings": {"site_dir": site, "scanner_path": stub}})
+            r = gui.api("POST", "/api/baseline/fetch", {})
+            self.assertEqual(r["version"], "3.10.12")
+            deadline = time.time() + 60
+            while True:
+                state = gui.api("GET", "/api/state")
+                if state["job"] is None:
+                    break
+                if time.time() > deadline:
+                    self.fail("the baseline job never finished")
+                time.sleep(0.5)
+            baseline_dir = gui.settings()["baseline_dir"]
+        self.assertIn("Baseline ready", state.get("status") or "")
+        expected = os.path.join(tools, "joomla-baselines", "Joomla_3.10.12")
+        self.assertEqual(os.path.normpath(baseline_dir), os.path.normpath(expected))
+
+
+class PreflightTest(unittest.TestCase):
+    """The check before a scan: the detected core version vs. the loaded clean baseline,
+    and the engines list for the footer. Everything runs on synthetic folders."""
+
+    @staticmethod
+    def _site(home, version=("3", "10", "12"), ext=True):
+        site = os.path.join(home, "site")
+        ver = os.path.join(site, "libraries", "cms", "version")
+        os.makedirs(ver)
+        with open(os.path.join(ver, "version.php"), "w", encoding="utf-8") as f:
+            f.write("<?php class JVersion { const RELEASE = '%s.%s'; const DEV_LEVEL = '%s'; }\n"
+                    % version)
+        if ext:
+            comp = os.path.join(site, "administrator", "components", "com_fooext")
+            os.makedirs(comp)
+            with open(os.path.join(comp, "com_fooext.xml"), "w", encoding="utf-8") as f:
+                f.write('<extension type="component" version="3.0" id="com_fooext">'
+                        "<name>Foo Ext</name><version>1.2.3</version></extension>\n")
+            core = os.path.join(site, "administrator", "components", "com_content")
+            os.makedirs(core)
+            with open(os.path.join(core, "com_content.xml"), "w", encoding="utf-8") as f:
+                f.write('<extension type="component" version="3.0" id="com_content">'
+                        "<name>Content</name><version>3.10.12</version></extension>\n")
+        return site
+
+    @staticmethod
+    def _baseline(home, version):
+        b = os.path.join(home, "Joomla_" + version)
+        ver = os.path.join(b, "libraries", "src")
+        os.makedirs(ver)
+        major, minor, patch = version.split(".")
+        with open(os.path.join(ver, "Version.php"), "w", encoding="utf-8") as f:
+            f.write("<?php class Version { const MAJOR_VERSION = %s; const MINOR_VERSION = %s;"
+                    " const PATCH_VERSION = %s; }\n" % (major, minor, patch))
+        return b
+
+    def test_preflight_without_a_baseline(self):
+        home = h.workdir("sbd-gui-")
+        site = self._site(home)
+        with h.Gui(home) as gui:
+            gui.api("POST", "/api/settings", {"settings": {"site_dir": site}})
+            pf = gui.api("POST", "/api/preflight", {})
+        self.assertEqual(pf["mode"], "no_baseline")
+        self.assertEqual(pf["joomla"], "3.10.12")
+
+    def test_preflight_mismatch(self):
+        home = h.workdir("sbd-gui-")
+        site = self._site(home)
+        base = self._baseline(home, "4.2.1")
+        with h.Gui(home) as gui:
+            gui.api("POST", "/api/settings", {"settings": {"site_dir": site, "baseline_dir": base}})
+            pf = gui.api("POST", "/api/preflight", {})
+        self.assertEqual(pf["mode"], "mismatch")
+        self.assertEqual(pf["baseline"]["version"], "4.2.1")
+
+    def test_preflight_match_is_ok(self):
+        home = h.workdir("sbd-gui-")
+        site = self._site(home)
+        base = self._baseline(home, "3.10.12")
+        with h.Gui(home) as gui:
+            gui.api("POST", "/api/settings", {"settings": {"site_dir": site, "baseline_dir": base}})
+            pf = gui.api("POST", "/api/preflight", {})
+        self.assertEqual(pf["mode"], "ok")
+
+    def test_preflight_without_a_detectable_engine(self):
+        home = h.workdir("sbd-gui-")
+        site = self._site(home, ext=False)
+        os.remove(os.path.join(site, "libraries", "cms", "version", "version.php"))
+        with h.Gui(home) as gui:
+            gui.api("POST", "/api/settings", {"settings": {"site_dir": site}})
+            pf = gui.api("POST", "/api/preflight", {})
+        self.assertEqual(pf["mode"], "no_engine")
+
+    def test_engines_list_third_party_but_not_core(self):
+        home = h.workdir("sbd-gui-")
+        site = self._site(home)
+        with h.Gui(home) as gui:
+            gui.api("POST", "/api/settings", {"settings": {"site_dir": site}})
+            names = {(e["name"], e["version"]) for e in gui.api("POST", "/api/preflight", {})["engines"]}
+            self.assertIn(("Joomla", "3.10.12"), names)
+            self.assertIn(("Foo Ext", "1.2.3"), names)
+            self.assertNotIn(("Content", "3.10.12"), names)   # bundled core: not an engine
+            # the same list reaches the footer through /api/state (refreshed on settings save)
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                st = gui.api("GET", "/api/state")
+                names = {(e["name"], e["version"]) for e in st["engines"]}
+                if ("Foo Ext", "1.2.3") in names:
+                    break
+                time.sleep(0.4)
+            self.assertIn(("Foo Ext", "1.2.3"), names)
+            # the Engines tab's 'original loaded' mark comes with it in /api/state
+            self.assertEqual(st["baseline"]["dir"], "")
+            self.assertFalse(st["baseline"]["match"])
+            base = self._baseline(home, "3.10.12")
+            gui.api("POST", "/api/settings", {"settings": {"baseline_dir": base}})
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                st = gui.api("GET", "/api/state")
+                if st["baseline"]["match"]:
+                    break
+                time.sleep(0.4)
+            self.assertTrue(st["baseline"]["match"])
+            self.assertEqual(st["baseline"]["version"], "3.10.12")
 
 
 if __name__ == "__main__":
