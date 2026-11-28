@@ -1337,6 +1337,137 @@ def build_xlsx(path, results, stats):
                       ("Summary", summ, [28, 50])])
 
 
+
+# -------------------------------------------------------------------------------
+# AI/user-prepared detection signatures (written by the GUI; see --user-signatures)
+# -------------------------------------------------------------------------------
+USER_SIG_KINDS = ("php", "js", "html", "htaccess", "ini", "text")
+USER_SIG_SEVERITIES = {"critical": SEV_CRIT, "obfuscated": SEV_OBF, "warning": SEV_WARN}
+
+
+def _user_sig_text(value):
+    if isinstance(value, (list, tuple)):
+        return " ".join(str(v) for v in value)
+    return str(value or "")
+
+
+def _user_sig_label(value):
+    label = _user_sig_text(value).strip()
+    if len(label) < 2:
+        raise ValueError("label is empty or too short (need at least 2 characters)")
+    if len(label) > 200:
+        raise ValueError("label is too long (%d chars, max 200)" % len(label))
+    return label
+
+
+def _user_sig_severity(value):
+    v = _user_sig_text(value).strip().lower().strip("[]")
+    if v == "obs":
+        v = "obfuscated"
+    if v not in USER_SIG_SEVERITIES:
+        raise ValueError("severity %r is not one of 'critical', 'obfuscated' or 'warning'" % (value,))
+    return USER_SIG_SEVERITIES[v]
+
+
+def _user_sig_kinds(value):
+    kinds = [k.strip().lower() for k in _user_sig_text(value).split()]
+    kinds = [k for k in kinds if k]
+    if not kinds or any(k not in USER_SIG_KINDS for k in kinds):
+        raise ValueError("kinds %r are not valid (allowed: %s)" % (value, ", ".join(USER_SIG_KINDS)))
+    return " ".join(dict.fromkeys(kinds))
+
+
+def _user_sig_pattern(value):
+    pattern = _user_sig_text(value).strip()
+    if len(pattern) < 2:
+        raise ValueError("pattern is empty or too short (need at least 2 characters)")
+    if len(pattern) > 400:
+        raise ValueError("pattern is too long (%d chars, max 400)" % len(pattern))
+    try:
+        rx = re.compile(pattern)
+    except re.error as exc:
+        raise ValueError("pattern is not a valid regex: %s" % exc)
+    for probe in ("", " "):
+        if rx.search(probe):
+            raise ValueError("pattern matches an empty or whitespace-only string - it would fire on every file")
+    return pattern
+
+
+def _user_sig_flags_text(value):
+    v = str(value or "").strip().lower()
+    if v in ("i", "ignorecase", "case_insensitive", "1", "true", "yes"):
+        return re.I
+    if v in ("", "none", "0", "false", "no", "ci"):
+        return 0
+    raise ValueError("flags %r are not supported (only case-sensitive or case-insensitive)" % (value,))
+
+
+def _user_sig_flags(item):
+    c = item.get("case_insensitive", None)
+    if c is not None:
+        if isinstance(c, bool):
+            return re.I if c else 0
+        return _user_sig_flags_text(c)
+    return _user_sig_flags_text(item.get("flags", "i"))
+
+
+def _user_sig_weight(value):
+    if value is None or value == "":
+        return None   # let S() apply the per-severity default
+    try:
+        w = int(value)
+    except (TypeError, ValueError):
+        raise ValueError("weight must be an integer, got %r" % (value,))
+    if not 1 <= w <= 30:
+        raise ValueError("weight %d is out of the 1-30 range" % w)
+    return w
+
+
+def load_user_signatures(path):
+    """-> (entries, problems). Same contract as load_whitelist: a malformed
+    entry is reported and skipped, never silently swallowed.
+
+    Entries are validated here so the scanner can never crash or flood the
+    scan with a broken pattern."""
+    with io.open(path, "r", encoding="utf-8", errors="replace") as f:
+        data = json.load(f)
+    if isinstance(data, dict):
+        entries = data.get("signatures")
+    else:
+        entries = data
+    if not isinstance(entries, list):
+        raise ValueError("expected a JSON list of signatures (or an object with a 'signatures' list)")
+    out, problems = [], []
+    for i, item in enumerate(entries):
+        try:
+            if not isinstance(item, dict):
+                raise ValueError("entry is not an object")
+            label = _user_sig_label(item.get("label"))
+            severity = _user_sig_severity(item.get("severity"))
+            kinds = _user_sig_kinds(item.get("kinds"))
+            pattern = _user_sig_pattern(item.get("pattern"))
+            weight = _user_sig_weight(item.get("weight"))
+            flags = _user_sig_flags(item)
+            out.append({"label": label, "pattern": pattern, "severity": severity,
+                        "kinds": kinds, "weight": weight, "flags": flags,
+                        "reason": _user_sig_text(item.get("reason"))[:400],
+                        "created": _user_sig_text(item.get("created"))[:60]})
+        except ValueError as exc:
+            problems.append((i + 1, str(exc), str(item)[:60]))
+    return out, problems
+
+
+def register_user_signatures(entries):
+    """Add the validated signatures to the scanner and keep the heaviest first."""
+    for e in entries:
+        try:
+            S(e["severity"], e["label"], e["pattern"], e["kinds"], e["weight"], e["flags"])
+        except (ValueError, re.error) as exc:
+            print("user-signatures: %r - ignored: %s" % (e.get("label"), exc))
+    for k in SIGS_BY_KIND:
+        SIGS_BY_KIND[k].sort(key=lambda t: (SEV_RANK[t[0]], -t[3]))
+
+
 # ---------------------------------------------------------------------------
 # 6) MAIN
 # ---------------------------------------------------------------------------
@@ -1373,16 +1504,42 @@ def load_whitelist(path):
 
 
 def build_baseline(clean_dir):
+    """sha256 of every .php in the clean tree. Fast path: the hash manifest that
+    joomla_baseline.py writes next to the tree it downloaded (Joomla_<v>.baseline.json) -
+    the hashes were computed right after the download, so a re-scan does not re-read
+    thousands of files. Files that are in the tree but not in the manifest are hashed
+    normally, so a hand-edited baseline can never make modified core files look clean."""
     base = {}
+    nd = os.path.normpath(clean_dir)
+    mf = os.path.join(os.path.dirname(nd), os.path.basename(nd) + ".baseline.json")
+    manifest = None
+    try:
+        with open(mf, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict) and isinstance(data.get("files"), dict) and data["files"]:
+            manifest = data["files"]
+    except (OSError, ValueError):
+        manifest = None
+    reused = 0
+    extra = 0
     for root, _dirs, files in os.walk(clean_dir):
-        for n in files:
-            if n.lower().endswith(".php"):
-                p = os.path.join(root, n)
-                try:
-                    with open(p, "rb") as fh:
-                        base[os.path.relpath(p, clean_dir).replace(os.sep, "/")] = hashlib.sha256(fh.read()).hexdigest()
-                except OSError:
-                    pass
+        for name in files:
+            if not name.lower().endswith(".php"):
+                continue
+            rel = os.path.relpath(os.path.join(root, name), clean_dir).replace(os.sep, "/")
+            if manifest is not None and rel in manifest:
+                base[rel] = str(manifest[rel])
+                reused += 1
+                continue
+            extra += 1
+            p = os.path.join(root, name)
+            try:
+                with open(p, "rb") as fh:
+                    base[rel] = hashlib.sha256(fh.read()).hexdigest()
+            except OSError:
+                pass
+    if manifest is not None:
+        print("  baseline hashes: %d reused from the manifest, %d hashed now" % (reused, extra))
     return base
 
 
@@ -1502,6 +1659,7 @@ def build_parser():
     ap.add_argument("--exclude-ext", default="", help="comma-separated extensions: .js,.json")
     ap.add_argument("--exclude-dir", default="", help="comma-separated folder names (ALL folders are scanned by default)")
     ap.add_argument("--whitelist", help="file: SHA-256, paths, folders (with a trailing /) or masks *; # - comment")
+    ap.add_argument("--user-signatures", help="JSON file of AI/user-prepared signatures (label/pattern/severity/kinds/weight/flags); malformed entries are reported and skipped")
     ap.add_argument("--audit-whitelisted", action="store_true",
                     help="do not skip files that match a whitelist PATH/folder/mask: scan them and report [CRITICAL] only")
     ap.add_argument("--strict", action="store_true",
@@ -1560,6 +1718,21 @@ def main(argv=None):
             return 1
         for line_no, reason, snippet in wl_problems:
             print("whitelist: line %d: %s - ignored: %r" % (line_no, reason, snippet))
+
+    if args.user_signatures:
+        if not os.path.isfile(args.user_signatures):
+            print("Cannot read the user signatures:", args.user_signatures)
+            return 1
+        try:
+            user_sigs, sig_problems = load_user_signatures(args.user_signatures)
+        except (OSError, ValueError) as e:
+            print("Cannot read the user signatures:", e)
+            return 1
+        for line_no, reason, snippet in sig_problems:
+            print("user-signatures: entry %d: %s - ignored: %r" % (line_no, reason, snippet))
+        if user_sigs:
+            register_user_signatures(user_sigs)
+            print("user-signatures: %d signature(s) loaded from %s" % (len(user_sigs), args.user_signatures))
 
     baseline = None
     base_dirs = set()

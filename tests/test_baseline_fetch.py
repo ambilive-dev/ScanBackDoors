@@ -376,5 +376,36 @@ class PipelineTest(unittest.TestCase):
         self.assertNotIn("Downloaded 0", res.out)
 
 
+class ScannerManifestTest(unittest.TestCase):
+    """The scanner's fast path: joomla_baseline.py writes the sha256 manifest right after
+    the download, and build_baseline() reuses it instead of re-hashing thousands of files."""
+
+    def _fetch(self):
+        z = fake_joomla_zip("man1")
+        p = release_for(z, "3.9.27")
+        out = h.workdir("sbd-bl-")
+        self.assertEqual(run_fetch("3.9.27", out, p).returncode, 0)
+        return os.path.join(out, "Joomla_3.9.27"), os.path.join(out, "Joomla_3.9.27.baseline.json")
+
+    def test_scanner_reuses_the_manifest_hashes(self):
+        tree, _man = self._fetch()
+        res, _report = h.scan(tree, "--baseline-dir", tree)
+        self.assertIn("3 reused from the manifest, 0 hashed now", res.out)
+
+    def test_without_a_manifest_everything_is_hashed_normally(self):
+        tree, man = self._fetch()
+        os.remove(man)
+        res, _report = h.scan(tree, "--baseline-dir", tree)
+        self.assertNotIn("reused from the manifest", res.out)
+        self.assertNotIn("Traceback", res.out)
+
+    def test_files_missing_from_the_manifest_are_hashed_now(self):
+        tree, man = self._fetch()
+        with open(os.path.join(tree, "cron.php"), "w") as f:
+            f.write("<?php\ndefined('_JEXEC') or die;\n")      # added to the tree by hand
+        res, _report = h.scan(tree, "--baseline-dir", tree)
+        self.assertIn("3 reused from the manifest, 1 hashed now", res.out)
+
+
 if __name__ == "__main__":
     unittest.main()
