@@ -1,0 +1,105 @@
+{
+ "budget_ratio": 1.3,
+ "corpus": {
+  "bytes": 192224177,
+  "files": 10000,
+  "given": false,
+  "seed": 20261128
+ },
+ "generated": "2026-11-28T22:27:16",
+ "machine_cpus": 16,
+ "platform": "Windows-10-10.0.26300-SP0",
+ "python": "3.11.9",
+ "record": 1,
+ "runs": {
+  "baseline": {
+   "command": [
+    "src/scan_backdoors.py",
+    "<CORPUS>",
+    "--no-progress",
+    "--no-csv",
+    "--json",
+    "<REPORT>",
+    "--yara-cache",
+    "<YARA-CACHE>",
+    "--workers",
+    "0"
+   ],
+   "exit_code": 2,
+   "files_per_s": 214.9,
+   "files_scanned": 10000,
+   "files_visited": 10000,
+   "flagged": 543,
+   "peak_rss_bytes": 151015424,
+   "peak_rss_source": "psapi_tree",
+   "scanner_time_s": 46.1,
+   "wall_s": 46.53,
+   "yara_rules_loaded": null,
+   "yara_scan_gaps": null
+  },
+  "yara_cold": {
+   "command": [
+    "src/scan_backdoors.py",
+    "<CORPUS>",
+    "--no-progress",
+    "--no-csv",
+    "--json",
+    "<REPORT>",
+    "--yara-cache",
+    "<YARA-CACHE>",
+    "--workers",
+    "0",
+    "--yara-rules",
+    "<RULE-PACKAGE>"
+   ],
+   "exit_code": 2,
+   "files_per_s": 236.7,
+   "files_scanned": 10000,
+   "files_visited": 10000,
+   "flagged": 543,
+   "peak_rss_bytes": 159113216,
+   "peak_rss_source": "psapi_tree",
+   "scanner_time_s": 41.9,
+   "wall_s": 42.25,
+   "yara_rules_loaded": 6,
+   "yara_scan_gaps": 0
+  },
+  "yara_warm": {
+   "command": [
+    "src/scan_backdoors.py",
+    "<CORPUS>",
+    "--no-progress",
+    "--no-csv",
+    "--json",
+    "<REPORT>",
+    "--yara-cache",
+    "<YARA-CACHE>",
+    "--workers",
+    "0",
+    "--yara-rules",
+    "<RULE-PACKAGE>"
+   ],
+   "exit_code": 2,
+   "files_per_s": 236.5,
+   "files_scanned": 10000,
+   "files_visited": 10000,
+   "flagged": 543,
+   "peak_rss_bytes": 158650368,
+   "peak_rss_source": "psapi_tree",
+   "scanner_time_s": 42.0,
+   "wall_s": 42.28,
+   "yara_rules_loaded": 6,
+   "yara_scan_gaps": 0
+  }
+ },
+ "tool": "bench_scan",
+ "verdict": {
+  "same_tree_scanned": true,
+  "yara_cold_ratio": 0.908,
+  "yara_cold_within_budget": true,
+  "yara_warm_ratio": 0.9087,
+  "yara_warm_within_budget": true
+ },
+ "workers": 0,
+ "yara_rules": "<RULE-PACKAGE>"
+}

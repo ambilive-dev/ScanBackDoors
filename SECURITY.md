@@ -60,7 +60,30 @@ point it at and writes only the reports you ask for.
   update the component. The local database ships empty (the scanner does not invent
   CVE data), so an offline audit against it honestly reports nothing.
 
-## Reporting a vulnerability
+## Supply chain
+
+What reaches a machine that runs these tools, and under what terms, is written in
+[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md). The short version: the tools import the
+standard library only, the two optional packages are imported inside the one function that
+needs them, and no third-party source file, detection rule or dataset is vendored here.
+
+About how this repository is built:
+
+- CI is pinned - actions by commit SHA, the Python 3.6/3.8 images by digest - so a moving
+  tag under the pipeline is not a way in. It asks for read-only repository permissions and
+  uses no secret; publishing anything outside the build (a code-scanning upload, for
+  instance) is not enabled and is a maintainer's decision.
+- CI runs this scanner over its own code and publishes the report. A backdoor in the tool
+  that finds backdoors would be found by the tool, on every push, by an unrelated code
+  path from the one that reads a customer's site.
+- The development tools (`requirements-dev.txt`) never enter a bundle or a customer's
+  machine; they exist in a checkout and in a CI job.
+- A third-party **rule package** installed by `updater.py` is hostile input by design: it
+  arrives only when an operator asked for it, under that source's licence, is unpacked into
+  a staging folder with path checks, is compiled file by file with `include` refused, and is
+  activated only after that - a wrong signature is a refusal, never a quiet downgrade. It is
+  never mirrored into this repository, and the channel ships closed for that reason.
+
 
 Please use [private vulnerability reporting](../../security/advisories/new) on this
 repository instead of a public issue. Public issues are the right place for false

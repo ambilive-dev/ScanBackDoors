@@ -18,6 +18,42 @@ python3 scan_backdoors.py [папка] [параметры]
 
 ---
 
+## Как проверить изменения
+
+Тесты требуют только Python: `python3 -m unittest discover -s tests`. Три инструмента,
+которые использует CI, закреплены в `requirements-dev.txt`; самих инструментов они не
+касаются — без них запускается ровно тот же набор тестов.
+
+```bash
+python3 -m pip install -r requirements-dev.txt
+python3 -m ruff check src engines tests tools benchmarks
+python3 -m bandit -q -r src engines tools -s B101,B104,B105,B110,B112,B310,B314,B324,B404,B405,B603,B606,B607
+python3 tools/coverage_run.py --require 70 --core engines --core src/scan_backdoors.py
+```
+
+Покрытие меряется через `tools/coverage_run.py`, а не через `coverage run`: тесты запускают
+CLI, графическую версию и чистильщик отдельными процессами, и обычный способ видит только
+родительский процесс (44 % вместо реальных 77 %). Что именно мерится и чего это число не
+видит — в `docs/ARCHITECTURE.md`.
+
+Стоимость опционального движка измеряется, а не угадывается:
+
+```bash
+python3 benchmarks/bench_scan.py --files 10000 --yara-rules "$(python3 src/updater.py --rules-path)"
+```
+
+Скрипт сканирует один и тот же сгенерированный набор файлов без пакета правил и с ним и
+падает, если превышен бюджет +30 % (ТЗ §9.3). Формат записи и эталонные замеры —
+в `benchmarks/README.md`.
+
+CI (`.github/workflows/ci.yml`) гоняет тесты на Linux и Windows на поддерживаемых версиях
+Python, с опциональным движком и без него, повторяет весь набор на настоящих интерпретаторах
+3.6 и 3.8 в образах, закрепленных по digest, проверяет линтеры и покрытие, сканирует этот
+репозиторий самим сканером (отчёт SARIF прикладывается к сборке) и делает небольшой прогон
+бенчмарка. Actions закреплены по commit SHA.
+
+---
+
 ## Быстрый старт
 
 ```bash

@@ -561,8 +561,12 @@ logs/updater.log                   rotating log (secrets and tokens are masked)
 ## Documentation
 
 - **[docs/README_RU.md](docs/README_RU.md)** — Russian command-line reference.
+- **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — how the pipeline actually runs, the trust
+  boundaries, the process model, and what the coverage number means.
 - **[CHANGELOG.md](CHANGELOG.md)** — what changed in each version.
 - **[SECURITY.md](SECURITY.md)** — what the tool guarantees, what it does not, and how to report a vulnerability.
+- **[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)** — what is not ours, under what terms it
+  reaches a machine, and where each licence fact was read.
 
 ## How does it compare to other tools?
 
@@ -644,8 +648,44 @@ web shells; `python tests/seal_payloads.py --show filefuns.php` prints any of th
 They are unsealed only into the fixture folder while a test runs - which is where
 real-time antivirus sometimes deletes them: the suite detects that, says which
 sample vanished and how to exclude the folder, rather than reporting a missed
-backdoor. `.github/workflows/ci.yml` runs the suite on Linux and Windows across
-supported Python versions.
+backdoor.
+
+### Checking a change
+
+The three tools CI uses are pinned in `requirements-dev.txt`; nothing here is a
+dependency of the tools, and the suite is the same suite without them.
+
+```
+python -m pip install -r requirements-dev.txt
+python -m ruff check src engines tests tools benchmarks
+python -m bandit -q -r src engines tools -s B101,B104,B105,B110,B112,B310,B314,B324,B404,B405,B603,B606,B607
+python tools/coverage_run.py --require 70 --core engines --core src/scan_backdoors.py
+```
+
+`ruff.toml` is the whole lint policy, and every exception in it says why. Coverage is run
+through `tools/coverage_run.py` and not through `coverage run`: this suite launches the
+CLI, the GUI and the cleaner as separate processes, and the plain recipe measures the
+parent only — about 44 % for code that is really at 77 %.
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) explains both traps and lists the current
+number per module.
+
+What an optional engine costs is measured, not guessed:
+
+```
+python benchmarks/bench_scan.py --files 10000 --yara-rules "$(python3 src/updater.py --rules-path)"
+```
+
+It scans the same generated tree without and with the rule package and fails above the
++30 % budget; [benchmarks/README.md](benchmarks/README.md) documents the record format and
+the reference records.
+
+CI (`.github/workflows/ci.yml`) runs the suite on Linux and Windows across supported
+Python versions, with the optional engine both present and absent; repeats the whole
+suite on the real 3.6 and 3.8 interpreters in digest-pinned images; applies lint, bandit
+and the coverage gate; scans this repository with its own scanner and publishes the SARIF;
+and runs a small benchmark. Actions are pinned to commit SHAs, and there is no `schedule:`
+trigger — see [docs/OPEN_QUESTIONS.md](docs/OPEN_QUESTIONS.md) for why that is a decision
+rather than a default.
 
 ## Why no dependencies
 

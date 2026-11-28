@@ -14,7 +14,6 @@ throw-away folder, the GUI runs as a subprocess with a private home.
 
 import json
 import os
-import shutil
 import sys
 import time
 import unittest

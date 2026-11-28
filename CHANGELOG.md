@@ -5,6 +5,64 @@ version for all components; it is written once in `src/version.py` and a
 release is a tag with that number.
 
 ## Unreleased
+- **Development, CI and measurement** (TZ v2 Sprint 4). Nothing in this entry changes what
+   the tools do: no command-line flag, report format, exit code, GUI setting or quarantine
+   behaviour is touched, and a default scan is byte-for-byte the run it was before.
+   * `.github/workflows/ci.yml` rewritten. The suite runs on Linux and Windows on Python
+     3.11 and 3.13, **with and without `yara-python` installed** — the leg with nothing
+     installed is where the project's central promise is actually checked. The whole suite
+     then runs again inside the real `python:3.6` and `python:3.8` images, pinned by
+     digest, because "3.6+" is a claim about an interpreter a newer runner cannot emulate.
+     A quality job runs `ruff`, `bandit` and the coverage gate; a self-scan job runs the
+     scanner over this repository itself and publishes the SARIF (the gate is over the
+     code: our own changelog quotes the markers the scanner hunts for, so scanning the docs
+     would be a report, not a gate); a benchmark job exercises `benchmarks/bench_scan.py`.
+     Actions are pinned to commit SHAs (each read from that action's own repository on
+     2026-11-28 — `actions/checkout` v7.0.1, `actions/setup-python` v7.1.0,
+     `actions/upload-artifact` v7.0.2), the workflow asks for `contents: read` only, uses no
+     secrets, and has no `schedule:` trigger (see `docs/OPEN_QUESTIONS.md`).
+   * `ruff.toml` is the lint policy for `src engines tests tools benchmarks`: the selected
+     rule families are the ones that found something, every exception carries a written
+     reason, and the Python 3.6 floor stays `tests/test_compat.py`'s job rather than the
+     linter's. Bringing the tree clean found real defects, now fixed: unused locals and
+     imports in `engines/inventory.py`, `engines/vuln_engine.py` (a `item = worst`
+     assignment that fed nothing), `engines/versions.py` (a `math.isnan` guard that could
+     never be reached), `engines/yara_engine.py`, `src/updater.py`, `src/scan_backdoors.py`;
+     closures over a loop variable in the restore path of `src/clean_malware.py` (the files
+     a manifest rollback touches) now bind the value they were written for.
+   * `tools/coverage_run.py` measures coverage over the whole family of processes the tests
+     spawn. The usual `coverage run -m unittest` recipe traces the parent only, and this
+     suite launches the CLI, the GUI, the cleaner and the updater as separate processes: the
+     same tests measured 43.9 % one way and 77.3 % the other, with `src/clean_malware.py`
+     and `src/scan_backdoors_gui.py` reading exactly 0 % while their end-to-end tests pass.
+     The CI gate is per module — `engines/` (90.8 %) and `src/scan_backdoors.py` (80.4 %)
+     each at 70 % as TZ §9.1 asks, plus the total (77.3 %) — rather than one average a
+     well-tested corner could pay for. `docs/ARCHITECTURE.md` explains both traps.
+   * `benchmarks/bench_scan.py` (with `benchmarks/README.md` and `benchmarks/reference/`)
+     puts the +30 % budget of TZ §9.3 on an exit code: it scans the same generated tree
+     without and with a rule package, cold and warm for the `.yarac` cache, reports
+     files/second and the peak RSS of the *whole process tree* under the name of the
+     facility that produced it, and refuses to read a ratio between runs that scanned
+     different numbers of files. First reference record (10 000 PHP files, 183 MB, Python
+     3.11 on Windows): the rule engine cost 0.91 of the baseline wall clock both cold and
+     warm — the engine is not what makes a scan slow.
+   * `requirements-dev.txt` pins the three development tools (coverage 7.17.5, ruff 0.17.6,
+     bandit 1.9.4) and records each package's own `requires_python`, which is stricter than
+     the shipped code's floor; `THIRD_PARTY_LICENSES.md` records what is not ours and where
+     each licence fact was read (yara-python Apache-2.0; cryptography Apache-2.0 OR
+     BSD-3-Clause; the minisign fixtures cross-checked against `jedisct1/go-minisign`, MIT)
+     — nothing third-party is vendored here, so there is no redistribution to licence;
+     `docs/ARCHITECTURE.md` describes the pipeline as the code runs it, the trust
+     boundaries, the process model and what the coverage number does not see.
+   * Tests: `tests/test_yara_check.py` (the rule linter's contract — one JSON object on
+     stdout, one exit code per outcome, a folder with a broken rule must not look like a
+     folder with no rules, `include` refused, and without the library it exits 2 rather than
+     reporting a clean pass), `tests/test_pipeline_core.py` (the report writers, the exit
+     codes and the startup refusals asserted in-process, where a failure can be read),
+     `tests/test_ci_and_bench.py` (the workflow as data: SHA pins rather than tags, digest
+     images, `contents: read`, no secrets, every directory that holds code inside the gate —
+     plus the benchmark's record format, its budget verdict and its refusal to compare unlike
+     runs).
 - **CMS audit** (TZ v2 Sprint 3): three new passes over *what is installed* instead of what is
    inside a file, all off by default so an ordinary scan is byte-for-byte what it was.
    `--inventory` lists the CMS and its components (WordPress core/plugins/mu-plugins/themes,

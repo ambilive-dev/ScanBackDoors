@@ -236,8 +236,9 @@ class AuditClient(object):
         finally:
             try:
                 resp.close()
-            except Exception:
-                pass
+            except Exception:                 # noqa: S110 - a response that refuses to
+                pass                          # close has nothing left to say, and raising
+                                              # here would hide the read error above it
         try:
             payload = json.loads(body.decode("utf-8", "replace"))
         except ValueError:

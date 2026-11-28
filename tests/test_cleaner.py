@@ -10,7 +10,6 @@ with a misleading 'the cleaner missed it'.
 
 import json
 import os
-import shutil
 import sys
 import unittest
 

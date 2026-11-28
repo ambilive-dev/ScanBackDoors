@@ -10,7 +10,6 @@ contacted.
 
 import csv
 import http.server
-import io
 import json
 import os
 import re
@@ -526,7 +525,7 @@ class SignatureLibraryTest(AiReviewTestBase):
     def test_the_scan_passes_the_user_signature_library(self):
         os.makedirs(self.home, exist_ok=True)
         with open(self._lib_path(), "w", encoding="utf-8") as f:
-            json.dump([{"label": "AI test wiring signature", "pattern": "<\?php",
+            json.dump([{"label": "AI test wiring signature", "pattern": r"<\?php",
                         "severity": "critical", "kinds": "php", "flags": "i", "weight": 30}], f)
         try:
             self.gui.api("POST", "/api/scan/start", {"settings": {

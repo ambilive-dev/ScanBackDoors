@@ -26,7 +26,9 @@ SCRIPTS = {
     "joomla_baseline.py": "joomla_baseline",
     "updater.py": "updater",
 }
-ROOT_FILES = ["README.md", "LICENSE", "CHANGELOG.md", "SECURITY.md", "start.bat", ".gitignore"]
+ROOT_FILES = ["README.md", "LICENSE", "CHANGELOG.md", "SECURITY.md", "start.bat", ".gitignore",
+              "THIRD_PARTY_LICENSES.md", "requirements-dev.txt",
+              os.path.join("docs", "ARCHITECTURE.md")]
 INTERNAL_FLAGS = {"progress-lines", "release-url"}   # plumbing, not documented as a user option
 
 

@@ -1,0 +1,76 @@
+# Ruff - the lint gate CI runs (`ruff check src engines tests tools`).
+#
+# Two facts decide what is checked here, and they pull in opposite directions:
+#
+#   1. The tools promise "Python 3.6+, standard library only" (README, every docstring).
+#      That promise is enforced by tests/test_compat.py, which parses each source with
+#      the 3.6 grammar and checks which modules it imports. A linter must not push this
+#      code towards idioms that break the oldest interpreter it has to run on.
+#   2. A lint job that only reports style is noise. The point is to catch a real defect
+#      - an unused result, a closure over a loop variable, a comparison that cannot be
+#      false - in ~7000 lines of scanner that runs against other people's servers.
+#
+# So the selected families are the ones that have caught something, and every ignored
+# rule below says why. `target-version` is py38 - the oldest interpreter CI runs - not
+# py36, because ruff's checks assume a newer standard library; the 3.6 floor is
+# test_compat's job, not the linter's.
+#
+# To add a family: run `ruff check --select <FAM> src engines tests tools` and read
+# every finding first. Never add a family and its ignore in the same commit.
+target-version = "py38"
+line-length = 120
+
+[lint]
+select = [
+    "F",        # pyflakes: unused or undefined names - plain defects
+    "E", "W",   # pycodestyle
+    "B",        # bugbear: the classic Python footguns
+    "S",        # bandit-style security checks, so the two linters tell the same story
+]
+ignore = [
+    "E501",   # line length: the rule tables and the embedded HTML/CSS are wide on purpose
+    "E402",   # imports after sys.path setup: the tools are run as scripts, from any cwd
+    "B904",   # `raise ... from`: inside `except` Python already keeps __context__, so the
+              # chain is intact; spelling `from exc` out at ~40 sites is a readability pass
+              # this repository has not made yet (and it changes no behaviour)
+    "B905",   # zip(strict=) is 3.10+ - the 3.6 floor forbids it
+]
+
+[lint.per-file-ignores]
+# Every entry is a property of that file, not a way to make the gate quiet.
+"src/scan_backdoors.py" = [
+    "S105",   # rule LABELS contain the word "token" (the thing they detect), no secrets
+    "E741",   # `C, O, W` are the one-letter severity tags that name ~200 rule rows
+]
+"src/scan_backdoors_gui.py" = [
+    "E741",   # ambiguous names (`l`) inside the generated HTML/JS of the page template
+    "S310",   # urlopen on 127.0.0.1: this is the GUI polling its own server
+    "S603", "S606", "S607",  # launching explorer/xdg-open/taskkill by name to show a file
+                             # to the user; the scanner itself is started with sys.executable
+]
+"engines/cms_api.py" = [
+    "S310",   # the URL is checked against the pinned host (check_url) before it is opened
+]
+"engines/inventory.py" = [
+    "S314",   # ElementTree on extension manifests: the defense is refusing DOCTYPE/ENTITY
+              # and capping the size, and defusedxml is not standard library
+]
+"engines/integrity_wp.py" = [
+    "S324",   # md5 is wordpress.org's own catalogue key for a core file, not a signature
+]
+"src/updater.py" = ["S310", "S603"]  # allowlisted URL before the request; the subprocess is
+                                     # sys.executable running engines/yara_check.py
+"src/joomla_baseline.py" = ["S310"]  # same: the pinned download host
+"tools/*" = ["S603", "S608"]         # sys.executable + a literal argv; sqlite SELECT is a
+                                     # constant of the script, the database is its own file
+"benchmarks/*" = [
+    "S311",   # random.Random(seed) builds a synthetic corpus: reproducibility is the
+              # feature, and nothing here is a key or a token
+    "S603",   # sys.executable running src/scan_backdoors.py with a literal argv list
+]
+"tests/*" = [
+    "S101", "S102", "S105", "S106", "S108", "S110", "S310", "S311", "S324", "S603", "S607",
+    "B011", "B018", "E741",          # asserts, sample "secrets", fixtures that look like
+    "PLR0124", "SIM117",             # webshells, temp folders, deliberately weak hashes,
+    "W605",                          # urllib against 127.0.0.1, `git` by name
+]

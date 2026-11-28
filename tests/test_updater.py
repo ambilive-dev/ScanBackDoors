@@ -694,9 +694,10 @@ class RuleCheckerTest(unittest.TestCase):
 # minisign signatures (OPEN_QUESTIONS #13)
 # ---------------------------------------------------------------------------
 # The fixtures below are real: minisign produced them, and the author's own reference
-# port (https://github.com/jedisct1/go-minisign, ISC) verifies both over the message
-# "test". Committing them is what keeps the format handling honest - this file checks
-# updater against minisign's output, not against a copy of updater's own writer.
+# port (https://github.com/jedisct1/go-minisign, MIT - its LICENSE says so, read 2026-11-28)
+# verifies both over the message "test". Committing them is what keeps the format
+# handling honest - this file checks updater against minisign's output, not against a
+# copy of updater's own writer.
 # The optional cryptography library is absent on many machines, so the policy around
 # it (what is refused, what falls back to the pinned hash, what --require-signature
 # forbids) is tested with a stand-in, and the real Ed25519 maths runs when present.
@@ -1123,7 +1124,7 @@ class SignatureBundleTest(unittest.TestCase):
         digest = hashlib.blake2b(self.blob, digest_size=64).digest()
         self.write_signature(signature_file(signature=self.sig, global_sig=self.glob, alg=b"ED"))
         accepts = {self.sig: digest, self.glob: self.sig + b"timestamp:1700000000\tfile:rules.zip"}
-        name = self.install(crypto=FakeCrypto(accepts))
+        self.install(crypto=FakeCrypto(accepts))
         self.assertEqual(self.doc()["verification"], "minisign-ed25519-prehashed")
         self.assertEqual(up.status(self.store)["signature"], "verified")
 
@@ -1150,7 +1151,7 @@ class SignatureBundleTest(unittest.TestCase):
     def test_without_the_library_a_pinned_hash_still_installs_and_says_so(self):
         self.pin_key()
         sha = up.sha256_file(self.bundle)
-        name = self.install(sha=sha, sig=False, crypto=FakeCrypto(missing=True))
+        self.install(sha=sha, sig=False, crypto=FakeCrypto(missing=True))
         doc = self.doc()
         self.assertEqual(doc["signature"], "not-checked")
         self.assertEqual(doc["verification"], "sha256-pinned")

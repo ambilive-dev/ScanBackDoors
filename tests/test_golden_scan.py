@@ -88,10 +88,14 @@ class GoldenMasterTest(unittest.TestCase):
         before = h.tree_hashes(site)
         h.scan(site, workers="1")
         after = h.tree_hashes(site)
-        # antivirus may remove a sample mid-run: that is the environment, not the scanner
-        stale = [r for r, digest in before.items()
-                 if r not in after and r in present and r not in vanished
-                 and os.path.exists(os.path.join(site, *r.split("/"))) is False]
+        # A sample the antivirus removed *during* the run makes this comparison
+        # meaningless: the tree at the end is not the tree that was scanned. That is
+        # the environment, not the scanner, so the run is skipped rather than passed
+        # on a comparison nobody could have made.
+        disappeared = [rel for rel in before if rel not in after]
+        if disappeared:
+            self.skipTest("the antivirus removed %d sample(s) while scanning"
+                          % len(disappeared))
         changed = {r: (before[r], after.get(r)) for r in before
                    if r in after and after[r] != before[r]}
         added = [r for r in after if r not in before]

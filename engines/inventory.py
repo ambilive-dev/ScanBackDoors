@@ -28,7 +28,6 @@ file says - versus "verified" - confirmed against an official reference).
 
 import os
 import re
-import stat
 
 from engines.versions import clean_version, compare_version
 

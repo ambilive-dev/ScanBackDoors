@@ -74,7 +74,7 @@ class ShippedAllowlistTest(unittest.TestCase):
     def test_it_holds_nothing_about_a_particular_customer(self):
         """Local paths, e-mails and absolute filesystem paths must never ship."""
         bad = []
-        for kind, value, comment in self.rows:
+        for _kind, value, comment in self.rows:
             for field in (value, comment):
                 if LOCAL_PATH.search(field):
                     bad.append("local path: %s" % field[:80])

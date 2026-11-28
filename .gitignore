@@ -32,6 +32,15 @@ _quarantine_*/
 Thumbs.db
 desktop.ini
 
+# measurement artifacts of the development tools (CI installs them; nothing here is
+# part of the bundle). tests/test_release.py walks the working tree, so a leftover
+# data file must be ignored rather than trusted to nobody running the linter locally
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+benchmarks/*-local.json
+
 # never commit real client material: audits, dumps, ACL backups
 *_audit.csv
 *-audit.csv

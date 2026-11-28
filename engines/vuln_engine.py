@@ -256,7 +256,6 @@ def _unknown_version(component, matches, source):
         score = entry.get("cvss") if isinstance(entry, dict) else None
         if isinstance(entry, dict) and entry.get("kev"):
             kev = True
-        item = worst
         if score is not None and (worst is None or (score or 0) > (worst.get("cvss") or 0)):
             worst = entry
     cve = (worst or {}).get("cve") or (matches[0].get("cve") if isinstance(matches[0], dict) else "")

@@ -1,0 +1,30 @@
+# Development tools. Nothing here is a dependency of ScanBackDoors.
+#
+# The scanner, the GUI, the cleaner, the baseline fetcher and the updater import the
+# standard library only (requirements-optional.txt is the whole story for the two
+# optional detection packages, and even those are imported inside one function). This
+# file is for a person who is going to *change* the code, and for the CI jobs that
+# measure it. Installing it changes nothing about how the tools behave: the tests are
+# the same 500-odd unittest cases with or without these packages, and the ones that
+# need a third-party library skip without saying "passed".
+#
+#   python -m pip install -r requirements-dev.txt
+#   python -m ruff check src engines tests tools benchmarks
+#   python -m bandit -q -r src engines tools -s B101,B104,B105,B110,B112,B310,B314,B324,B404,B405,B603,B606,B607
+#   python tools/coverage_run.py --require 70
+#
+# Pinned, because a lint gate whose tool changes underneath it produces a diff nobody
+# asked for. Versions are the ones this repository was brought clean on 2026-11-28;
+# requires_python is recorded from each package's own PyPI metadata, so the constraint
+# is visible here instead of arriving as an install error - note that it is stricter
+# than the shipped code's floor:
+#   coverage 7.17.5 -> Python >= 3.11     bandit 1.9.4 -> >= 3.10     ruff 0.17.6 -> >= 3.7
+# The interpreters below that floor (3.6, 3.8) run the *suite* - see the floor job in
+# .github/workflows/ci.yml - and nothing measures coverage there.
+#
+# Licences: coverage and bandit are Apache-2.0, ruff is MIT (see
+# THIRD_PARTY_LICENSES.md). They never enter a bundle or a customer's machine.
+
+coverage==7.17.5
+ruff==0.17.6
+bandit==1.9.4

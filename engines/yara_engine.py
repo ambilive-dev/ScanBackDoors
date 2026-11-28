@@ -208,7 +208,7 @@ def build_yara_engine(sources, cache_dir="", base_externals=None, timeout=5.0):
     loaded = []
     if rules is None:
         # per-file isolation: add one file at a time, keep what compiles
-        for ns, path, data in read:
+        for ns, path, _data in read:
             candidate = dict(loaded)
             candidate[ns] = path
             try:

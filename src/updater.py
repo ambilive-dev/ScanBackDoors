@@ -887,7 +887,7 @@ def channel_upstream(store, only, allow_unverified, log_lines, _download=downloa
                 verifs.append(sig["verification"])
                 key_ids.append(sig["key_id"])
                 inner = os.path.join(staging, name)
-                written = safe_extract_zip(os.path.join(staging, name + ".zip"), inner)
+                safe_extract_zip(os.path.join(staging, name + ".zip"), inner)
                 found = collect_rules(inner)
                 if not found:
                     raise UpdateError("the archive of %s contains no rule files" % name)
@@ -978,7 +978,7 @@ def channel_project(store, allow_unverified, log_lines, _download=download, requ
         if want_sha:
             log_lines.append("package %s matches the pinned sha256 %s"
                              % (os.path.basename(url), got[:12]))
-        written = safe_extract_zip(dest, staging)
+        safe_extract_zip(dest, staging)
         meta = {"release": "project-" + got[:12], "source": "project",
                 "archive_sha256": got,
                 "verified": sig["verification"] != "none" or bool(want_sha),

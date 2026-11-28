@@ -418,7 +418,7 @@ def validate_paths(settings):
     bad = []
     scanner_raw = str(settings.get("scanner_path") or "").strip()
     base = Path(scanner_raw).expanduser().parent if scanner_raw else Path.cwd()
-    for key, kind, required in PATH_FIELDS:
+    for key, kind, _required in PATH_FIELDS:
         raw = str(settings.get(key) or "").strip()
         if not raw:
             if key == "scanner_path":
@@ -4648,8 +4648,8 @@ def main(argv=None):
     if hasattr(sys.stdout, "reconfigure"):
         try:
             sys.stdout.reconfigure(errors="replace")
-        except Exception:
-            pass
+        except Exception:                           # noqa: S110 - a stdout that refuses to
+            pass                                    # be reconfigured must not stop the GUI
 
     if not (1 <= args.port <= 65535):
         print("Invalid port %d (expected 1-65535)." % args.port)

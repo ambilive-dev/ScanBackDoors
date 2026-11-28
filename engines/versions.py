@@ -22,6 +22,7 @@ Everything here is pure: no files, no network, no state. That is what makes the
 table-driven tests in tests/test_versions.py enough.
 """
 
+import math
 import re
 
 # A version we understand: an optional "v", at least one dotted number, and at
@@ -247,7 +248,7 @@ def cvss_severity(score, vector=None):
         value = float(score)
     except (TypeError, ValueError):
         return "unknown"
-    if value != value:                      # NaN never compares usefully
+    if math.isnan(value):                   # NaN never compares usefully
         return "unknown"
     if value >= 9.0:
         return "critical"

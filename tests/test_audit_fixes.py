@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Regression tests for the findings of the November 2026 external code review.
+r"""Regression tests for the findings of the November 2026 external code review.
 
 Supplied with the review package and adapted to the shared test harness: sites,
 reports and quarantine copies live under the single AV-excluded fixtures root

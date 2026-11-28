@@ -1,0 +1,40 @@
+# Coverage of the shipped code only: the tests are the measuring instrument, not
+# the thing being measured.
+#
+# Branch coverage, not just lines: in this project the important behaviour often
+# lives in the branch that was NOT taken (an unreadable file, a refused URL, a
+# version that could not be parsed), and a line-only percentage hides how much of
+# that is exercised.
+#
+# parallel = True is not a preference. The scanner parallelises with `multiprocessing`,
+# and the tests drive the CLI, the GUI, the cleaner and the updater as **child
+# processes**; a run is a family of several hundred interpreters. Without this every one
+# of them writes the same data file and the last to finish wins, so the report is a
+# lottery. With it, each process writes its own file and `coverage combine` takes the
+# union - which is the number that answers the question coverage is asked here: has any
+# test, anywhere in the family, executed this line?
+#
+# Read this file with tools/coverage_run.py, do not run `coverage run -m unittest` by
+# hand. Two reasons, both of them ways the naive command gets a confidently wrong
+# answer:
+#   * the children are separate processes, and only tools/coverage_run.py arranges for
+#     each of them to start coverage before it imports anything;
+#   * `source` below is resolved against the working directory of the process reading
+#     this file, and the tests start the tools with cwd=src/. A child then looks for
+#     src/src, finds nothing, and records nothing - src/clean_malware.py and
+#     src/scan_backdoors_gui.py read 0 % that way although the end-to-end tests drive
+#     them hard. The tool writes a runtime configuration with absolute paths instead.
+#
+# The gate itself is in .github/workflows/ci.yml; what the number means and how it is
+# produced is in docs/ARCHITECTURE.md.
+[run]
+branch = True
+parallel = True
+source =
+    src
+    engines
+
+[report]
+precision = 1
+exclude_lines =
+    pragma: no cover

@@ -8,7 +8,6 @@ must never be reported at all.
 """
 
 import hashlib
-import io
 import os
 import sys
 import unittest

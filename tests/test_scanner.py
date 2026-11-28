@@ -6,10 +6,8 @@ sample is found with the signatures its description promises. If antivirus ate
 a sample the test says so instead of reporting a missed backdoor.
 """
 
-import io
 import os
 import sys
-import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

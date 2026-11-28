@@ -239,7 +239,7 @@ S(C, "dynamic variable from a superglobal (${$_GET / ${$_POST ...)", r"(?<!\\)\$
 # token check against the request: the classic gate of a webshell (?t=<hash>).
 # On WordPress this is the NORMAL nonce check (wp_verify_nonce -> hash_equals),
 # so like the harvester it is gated off on detected WP sites.
-TOKEN_GATE_LABEL = "hash_equals() comparing against request data (token-gated backdoor)"
+TOKEN_GATE_LABEL = "hash_equals() comparing against request data (token-gated backdoor)"   # noqa: S105 - a label of a detection rule, not a secret
 S(O, TOKEN_GATE_LABEL, r"\bhash_equals\s*\([^;{\n]{0,150}?" + RQ, "php", 8)
 # a variable from the request goes into a file function (read/write/list via LFI)
 S(O, "file function fed by a variable from request data", r"(\$[\w]+)\s*=\s*@?" + TAINT_SRC + r"\s*;[\s\S]{0,300}?\b(?:fopen|opendir|readfile|file_get_contents|file_put_contents|file|copy|rename|move_uploaded_file|unlink|chmod|touch)\s*\(\s*[^;{\n]{0,80}?\1\b", "php", 8)
@@ -722,8 +722,8 @@ def base64_literal_hits(text, folder):
         b = m.group(2)
         try:
             dec = base64.b64decode(b + "=" * (-len(b) % 4)).decode("utf-8")
-        except Exception:
-            continue
+        except Exception:                           # noqa: S112 - a candidate that is not
+            continue                                # base64 is not a finding, just noise
         if not dec or not dec.isprintable():
             continue
         line = text.count("\n", 0, m.start()) + 1
@@ -2086,7 +2086,7 @@ def self_test():
                 ok += 1
                 print("  [PASS] %s: %s" % (rel, ", ".join("'%s'" % e for e in expected)))
             else:
-                found = ", ".join("'%s'" % l for l in labels[:4]) or "nothing"
+                found = ", ".join("'%s'" % label for label in labels[:4]) or "nothing"
                 print("  [FAIL] %s: expected %s, got %s"
                       % (rel, ", ".join("'%s'" % e for e in missing), found))
     finally:
@@ -2175,8 +2175,8 @@ def main(argv=None):
     if hasattr(sys.stdout, "reconfigure"):
         try:
             sys.stdout.reconfigure(errors="replace")
-        except Exception:
-            pass
+        except Exception:                           # noqa: S110 - a stdout that refuses to
+            pass                                    # be reconfigured must not stop a scan
     def emit(tag, payload=""):
         if args.progress_lines:
             print("@@%s %s" % (tag, payload), flush=True)
