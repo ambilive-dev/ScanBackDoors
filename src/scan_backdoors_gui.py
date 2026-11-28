@@ -14,6 +14,7 @@ Starting the script again while it is already running just opens the browser tab
 """
 import argparse
 import csv
+import errno
 import json
 import os
 import re
@@ -39,6 +40,7 @@ try:                                       # single source of truth: version.py 
 except ImportError:                        # the GUI is useless without the scanner, but never crash on import
     VERSION, MIN_SCANNER = "3.3", "2.1"    # keep in sync with src/version.py (tests/test_release.py checks it)
 DEFAULT_PORT = 8765
+PORT_FALLBACK_SPAN = 100    # how many consecutive ports the startup loop tries (see _pick_port)
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = Path.home() / ".scan_backdoors_gui.json"
 API_HEADER = "X-Requested-With"
@@ -2095,6 +2097,43 @@ def ping(port):
         return False
 
 
+def _pick_port(start, span=PORT_FALLBACK_SPAN):
+    """Try to bind the GUI server to ports `start` .. `start + span - 1`, in order.
+
+    Returns (server, port, error). `server` is the bound Server object (the
+    caller owns it). `error` is the OSError from the most recent attempt, kept
+    so the caller can tell "excluded by the operating system" (EACCES) apart
+    from "busy port" (EADDRINUSE). When every port in the range refuses to
+    bind, server is None.
+    """
+    last_error = None
+    for p in range(start, min(start + span, 65536)):
+        try:
+            return Server(("127.0.0.1", p), Handler), p, None
+        except OSError as e:
+            last_error = e
+    return None, None, last_error
+
+
+def _bind_failure_lines(start, span, error):
+    """The printed lines used when every port in the range refused to bind."""
+    lines = ["Could not bind a port in the range %d-%d." % (start, min(start + span, 65536) - 1)]
+    if getattr(error, "errno", None) == errno.EACCES:
+        if os.name == "nt":
+            lines.append("The system refuses to use those ports (access denied). On Windows this is the")
+            lines.append("excluded port range. List it with:")
+            lines.append("  netsh int ipv4 show excludedportrange protocol=tcp")
+            lines.append("Pick a range outside it, e.g.:  --port 8800")
+        else:
+            lines.append("The system refuses to use those ports (access denied).")
+            lines.append("If they are below 1024 they need elevated privileges - pick a port at or above")
+            lines.append("1024, e.g.:  --port 9000")
+    else:
+        lines.append("The ports in that range refused to bind: %s" % (error if error is not None else "unknown"))
+        lines.append("Pick another port, e.g.:  --port 9000")
+    return lines
+
+
 def _ver_tuple(v):
     t = tuple(int(x) for x in str(v).split(".")[:3])
     return t + (0,) * (3 - len(t))
@@ -2179,6 +2218,10 @@ def main(argv=None):
         except Exception:
             pass
 
+    if not (1 <= args.port <= 65535):
+        print("Invalid port %d (expected 1-65535)." % args.port)
+        return 2
+
     if ping(args.port):
         url = "http://127.0.0.1:%d/" % args.port
         print("Scan Backdoors GUI is already running: %s" % url)
@@ -2186,16 +2229,10 @@ def main(argv=None):
             webbrowser.open(url)
         return 0
 
-    server, port = None, args.port
-    for p in range(args.port, args.port + 20):
-        try:
-            server = Server(("127.0.0.1", p), Handler)
-            port = p
-            break
-        except OSError:
-            continue
+    server, port, bind_error = _pick_port(args.port)
     if server is None:
-        print("Could not bind a port in the range %d-%d." % (args.port, args.port + 19))
+        for line in _bind_failure_lines(args.port, PORT_FALLBACK_SPAN, bind_error):
+            print(line)
         return 1
     app = App(port)
     app.shutdown_cb = server.shutdown
@@ -2204,7 +2241,7 @@ def main(argv=None):
     print("Scan Backdoors GUI %s" % VERSION)
     print("Open in your browser: %s   (bookmark it)" % url)
     if port != args.port:
-        print("NOTE: port %d was busy, using %d. The bookmark URL changes when the port does." % (args.port, port))
+        print("NOTE: port %d was not usable, using %d instead. The bookmark URL changes when the port does." % (args.port, port))
     print("The server listens on 127.0.0.1 only. Press Ctrl+C or use 'Quit server' in the page to stop.")
     if not args.no_browser:
         threading.Timer(0.6, webbrowser.open, [url]).start()

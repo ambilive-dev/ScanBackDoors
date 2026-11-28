@@ -72,7 +72,17 @@ A path field that does not check out (missing scanner, missing save folder, unre
 
 The server always uses the same address, **http://127.0.0.1:8765/** (the port is fixed on purpose). Bookmark it and the page opens from the bookmark whenever the server is running.
 Starting the script a second time while it is already running does not start another copy, it only opens the page again.
-If port 8765 is taken by another program, the next free port is used and the console prints the new address (the bookmark then has to be updated).
+If port 8765 is taken by another program or excluded by the operating system, the next free port in a 100-port range from it (8765-8864) is used and the console prints the new address and the reason (the bookmark then has to be updated). If every port in that range is unusable, the console explains why and exits with code 1.
+
+On Windows, ports in the excluded range cannot be bound at all. List them with:
+
+```
+netsh int ipv4 show excludedportrange protocol=tcp
+```
+
+Pick a `--port` outside the excluded range, e.g. `--port 8800`, and start the GUI with it; the printed address is then stable. On Linux/macOS, values below 1024 need elevated privileges - pick a port at or above 1024.
+
+An invalid `--port` (below 1 or above 65535) is rejected up front with exit code 2.
 
 To have the server running all the time without a console window, on Windows put a shortcut to `pythonw src\scan_backdoors_gui.py --no-browser` into the Startup folder (`Win+R`, `shell:startup`).
 The page remembers the last state (log, results) while the server runs, so you can close and reopen the tab at any moment.
