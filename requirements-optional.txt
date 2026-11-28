@@ -10,3 +10,13 @@
 # TODO(verify): the minimum version that supports per-scan externals and the
 # include_callback reliably; developed and recorded against 4.5.4.
 yara-python>=4.1.0
+
+# cryptography lets updater.py honour a pinned minisign public key (Ed25519).
+# Without it the updater still installs and verifies rule packages by their
+# pinned sha256 - it simply says out loud that a signature went unchecked, and
+# refuses to do that only when you ask for --require-signature. The scanner
+# never imports this package; updater.py imports it inside one function, and
+# only when a pinned source actually carries a signature.
+# TODO(verify): the ed25519 module is documented as new in cryptography 2.6;
+# developed and recorded against 50.0.2.
+cryptography>=2.6

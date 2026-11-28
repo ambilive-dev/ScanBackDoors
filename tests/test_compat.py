@@ -33,6 +33,12 @@ def engine_sources():
 
 
 FIRST_PARTY = {"version", "engines"}     # modules that live in this repository
+# The only third-party modules the bundle may know about, both from
+# requirements-optional.txt: yara-python (the optional YARA engine) and cryptography
+# (updater.py checking a minisign signature). Both must be imported INSIDE a function:
+# a module-level import would break the stdlib-only promise for every user who
+# installed neither, and that promise is why the tool can be dropped onto a server.
+OPTIONAL_THIRD_PARTY = {"yara", "cryptography"}
 
 
 def imported_names(tree):
@@ -65,23 +71,23 @@ class SyntaxFloorTest(unittest.TestCase):
                           % (os.path.basename(path), OLDEST[0], OLDEST[1]))
 
     def test_no_third_party_imports(self):
-        """No dependencies: the whole point of the tool."""
+        """No dependencies: the whole point of the tool. The optional packages of
+        requirements-optional.txt are allowed only as a lazy import inside a
+        function, so a user who installed nothing still runs the whole bundle."""
         stdlib = set(getattr(sys, "stdlib_module_names", ()))
-        allowed_third = set()
         for path in sources():
             tree = ast.parse(read(path), filename=path)
-            for node in ast.walk(tree):
-                names = []
-                if isinstance(node, ast.Import):
-                    names = [a.name.split(".")[0] for a in node.names]
-                elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
-                    names = [node.module.split(".")[0]]
-                for name in names:
-                    if name in allowed_third or name in FIRST_PARTY:
-                        continue
-                    if stdlib and name not in stdlib:
-                        self.fail("%s imports %r: the tools must run on a stdlib-only Python"
-                                  % (os.path.basename(path), name))
+            for node, name in imported_names(tree):
+                if name in FIRST_PARTY or not (stdlib and name not in stdlib):
+                    continue                                   # first-party or standard library
+                if name in OPTIONAL_THIRD_PARTY:
+                    self.assertTrue(self._inside_function(tree, node),
+                                    "%s imports %r at module level: an optional dependency "
+                                    "must be imported lazily inside a function"
+                                    % (os.path.basename(path), name))
+                    continue
+                self.fail("%s imports %r: the tools must run on a stdlib-only Python"
+                          % (os.path.basename(path), name))
 
     def test_engines_may_only_import_third_party_lazily(self):
         """engines/ is first-party and follows the same rules; the single
@@ -94,7 +100,7 @@ class SyntaxFloorTest(unittest.TestCase):
             for node, mod in imported_names(tree):
                 if mod in FIRST_PARTY or (stdlib and mod in stdlib):
                     continue
-                if mod == "yara":         # the one optional dependency (requirements-optional.txt)
+                if mod in OPTIONAL_THIRD_PARTY:   # the optional deps of requirements-optional.txt
                     self.assertTrue(self._inside_function(tree, node),
                                     "%s imports %r at module level: an optional engine "
                                     "dependency must be imported lazily inside a function"

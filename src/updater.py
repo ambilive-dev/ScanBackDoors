@@ -2,12 +2,16 @@
 # -*- coding: utf-8 -*-
 """
 signature updater - safe download, verification and activation of YARA rule
-packages for scan_backdoors (TZ v2, section 7). Standard library only (Python 3.6+).
+packages for scan_backdoors (TZ v2, section 7). Standard library only (Python 3.6+);
+the one optional dependency is 'cryptography', imported inside a function and only
+when a pinned source actually carries a minisign signature.
 
 Trust model (v2): nothing is fetched "from a branch". A rule set is installed only as
 a whole, atomically activated release, after integrity checks; a release is either
-fully verified or explicitly accepted with --allow-unverified (loudly, and the
-manifest records "verified": false). A failed source never erases what already works.
+verified by a pinned minisign signature (the strongest anchor, checked with the
+optional 'cryptography' package), or by a pinned sha256, or explicitly accepted with
+--allow-unverified (loudly, and the manifest records "verified": false). A failed
+source never erases what already works.
 
 Channels:
     python3 updater.py --update-from-bundle signatures.zip    # offline package (same checks)
@@ -27,6 +31,7 @@ Exit codes: 0 - everything updated, 1 - usage/config error,
 """
 
 import argparse
+import base64
 import hashlib
 import io
 import json
@@ -68,11 +73,16 @@ EXIT_OK, EXIT_CONFIG, EXIT_PARTIAL, EXIT_VERIFY = 0, 1, 3, 4
 
 SOURCES_TEMPLATE = {
     "_readme": "Pinned rule channels. Nothing here is trusted because it is popular: review "
-               "each source, its licence and both hashes by hand before adding it.",
-    "package_source": {},          # {"url": "https://…/v1/rules.zip", "sha256": "<64 hex>"}
+               "each source, its licence and both hashes by hand before adding it. A minisign "
+               "public key (minisign_pub: the single base64 line of a .pub file) is the strongest "
+               "anchor - the updater then activates only what that key signed. Pin a key AND a "
+               "sha256 while a channel is young; when both are pinned, both are checked.",
+    "package_source": {},          # {"url": "https://…/v1/rules.zip", "sha256": "<64 hex>",
+                                   #  "minisign_pub": "RWQ…", "signature_url": "https://…/rules.zip.minisig"}
     "allowed_hosts": [],           # extra https hosts the pinned URLs may live on
     "upstream": [],                # [{"name": "…", "repo": "owner/name", "commit": "<40 hex>",
-                                   #   "archive_sha256": "<64 hex>", "license": "…"}]
+                                   #   "archive_sha256": "<64 hex>", "license": "…",
+                                   #   "minisign_pub": "…" (optional, GitHub publishes no .minisig)}]
 }
 
 
@@ -246,6 +256,205 @@ def sha256_file(path):
         for chunk in iter(lambda: f.read(65536), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# package signatures: the minisign format, checked with the optional cryptography
+# package (TZ v2 7.2, OPEN_QUESTIONS #13)
+# ---------------------------------------------------------------------------
+# The format is minisign's (https://github.com/jedisct1/minisign), read off the
+# author's own reference port https://github.com/jedisct1/go-minisign:
+#   public key  : "untrusted comment: ..." + base64("Ed" | key id[8] | key[32])  = 42 bytes
+#   signature   : 4 lines - untrusted comment, base64(alg[2] | key id[8] | sig[64]) = 74 bytes,
+#                 "trusted comment: ...", base64(global signature[64]) = 64 bytes
+#   alg "Ed" signs the file itself, "ED" signs BLAKE2b-512 of it (`minisign -prehash`);
+#   the global signature covers sig[64] + the text after "trusted comment: ".
+# Nothing beyond those facts is claimed here, and tests/test_updater.py checks this
+# code against signatures the real minisign program produced. The minisign binary is
+# never run: downloaded keys and signatures are only parsed and verified in-process.
+
+MINISIGN_KEY_ALG = b"Ed"                                  # minisign public keys are Ed25519
+MINISIGN_ALGS = {b"Ed": "minisign-ed25519",               # signs the file
+                 b"ED": "minisign-ed25519-prehashed"}     # signs blake2b-512 of the file
+TRUSTED_PREFIX = "trusted comment: "
+MINISIG_MAX = 8192                                        # a .minisig file is 4 short lines
+NO_CRYPTO = "the optional 'cryptography' package is not installed (pip install cryptography)"
+
+
+def _b64(text, what, length):
+    try:
+        blob = base64.b64decode(text, validate=True)
+    except (TypeError, ValueError):
+        raise UpdateError("%s is not valid base64" % what)
+    if len(blob) != length:
+        raise UpdateError("%s must decode to %d bytes, decoded %d" % (what, length, len(blob)))
+    return blob
+
+
+def parse_minisign_pub(text):
+    """A pinned minisign public key -> (key id hex, 32 key bytes).
+
+    Accepts the two-line minisign.pub form (comment + key) or a bare base64 key,
+    which is what sources.json holds. A key nobody can name is not a trust anchor:
+    anything but a 42-byte 'Ed' record is refused here, once, at the config."""
+    lines = [ln.strip() for ln in str(text).replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    body = [ln for ln in lines if ln and not ln.lower().startswith("untrusted comment:")]
+    if len(body) != 1:
+        raise UpdateError("a minisign public key is one base64 line (optionally with a "
+                          "'untrusted comment:' line above it), found %d candidate line(s)" % len(body))
+    blob = _b64(body[0], "the minisign public key", 42)
+    if blob[:2] != MINISIGN_KEY_ALG:
+        raise UpdateError("the pinned minisign key is %r, only the Ed25519 algorithm 'Ed' is supported"
+                          % blob[:2].decode("latin1"))
+    return blob[2:10].hex(), blob[10:]
+
+
+def parse_minisign_sig(text):
+    """A .minisig file -> {"alg", "key_id", "signature", "trusted", "global"}."""
+    lines = str(text).replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    while lines and not lines[-1].strip():
+        lines.pop()                         # the file may end with a newline, nothing else may be empty
+    if len(lines) != 4:
+        raise UpdateError("a minisign signature is 4 lines (comment, key+signature, trusted "
+                          "comment, global signature), found %d" % len(lines))
+    head = _b64(lines[1].strip(), "the minisign signature block", 74)
+    glob = _b64(lines[3].strip(), "the minisign global signature", 64)
+    alg = head[:2]
+    if alg not in MINISIGN_ALGS:
+        raise UpdateError("unsupported minisign signature algorithm %r" % alg.decode("latin1"))
+    if not lines[2].startswith(TRUSTED_PREFIX):
+        raise UpdateError("the third line of a minisign signature must start with %r" % TRUSTED_PREFIX)
+    return {"alg": alg, "key_id": head[2:10].hex(), "signature": head[10:74],
+            "trusted": lines[2][len(TRUSTED_PREFIX):], "global": glob}
+
+
+def have_cryptography():
+    """Whether a minisign signature can be checked at all in this build."""
+    import importlib.util
+    try:
+        return importlib.util.find_spec("cryptography") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def minisign_verifier():
+    """-> callable(public_key, message, signature) -> bool, from the optional package.
+
+    The only place 'cryptography' is imported. UpdateError when it is missing: the
+    caller decides whether that is a refusal (--require-signature) or a loud fallback
+    to the pinned sha256 - the updater keeps working without the package either way."""
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+        from cryptography.exceptions import InvalidSignature
+    except ImportError:
+        raise UpdateError(NO_CRYPTO)
+
+    def verify(public, message, signature):
+        try:
+            Ed25519PublicKey.from_public_bytes(public).verify(signature, message)
+            return True
+        except InvalidSignature:
+            return False
+    return verify
+
+
+def load_pinned_key(cfg, base_dir=""):
+    """The minisign key a source pins -> (key id hex, key bytes), or None when it pins none.
+
+    'minisign_pub' holds the key itself (base64, what sources.json should carry);
+    'minisign_pub_file' points at a .pub file, relative names are taken from the
+    folder of sources.json - the key is pinned config, never something downloaded."""
+    text = cfg.get("minisign_pub")
+    if not text:
+        ref = cfg.get("minisign_pub_file")
+        if not ref:
+            return None
+        path = str(ref)
+        if not os.path.isabs(path):
+            path = os.path.join(base_dir or ".", path)
+        try:
+            with io.open(path, encoding="utf-8") as f:
+                text = f.read()
+        except OSError as exc:
+            raise UpdateError("the pinned minisign public key %s cannot be read: %s" % (path, exc))
+    return parse_minisign_pub(text)
+
+
+def _hash_only(label, sha_pinned, require, why, log_lines, key_id=None):
+    """A pinned key could not do its job. Fall back to the pinned hash - loudly -
+    only when a pinned hash really covers the archive; --require-signature forbids it."""
+    if require:
+        raise UpdateError("%s: %s, and --require-signature forbids the hash-only fallback"
+                          % (label, why))
+    if not sha_pinned:
+        raise UpdateError("%s: %s, and no pinned sha256 covers it either" % (label, why))
+    log.warning("%s: %s - the package is trusted through its pinned sha256 only", label, why)
+    log_lines.append("Signature NOT checked: %s - the package is trusted through its pinned "
+                     "sha256 only" % why)
+    return {"verification": "sha256-pinned", "signature": "not-checked", "key_id": key_id}
+
+
+def check_signature(label, cfg, base_dir, archive, url, allowed, sha_pinned, log_lines,
+                    require=False, sig_text=None, _download=download):
+    """Does the pinned key sign exactly these bytes? -> what the manifest records.
+
+    The result is {"verification", "signature", "key_id"}:
+      "none"                       - the source pins no key: the checks are exactly
+                                     what they were before signatures existed;
+      "minisign-ed25519"(-prehashed) - the pinned key signed these very bytes;
+      "sha256-pinned"/"not-checked" - a key is pinned but could not speak (no
+                                     'cryptography', no signature file, no signature
+                                     URL): the pinned sha256 is the only anchor left.
+    A signature that is present and wrong is a refusal, never a fallback: falling back
+    would be exactly the downgrade an attacker wants. `url=None` means "offline: no
+    signature can be fetched" (--update-from-bundle without --signature).
+    """
+    pinned = load_pinned_key(cfg or {}, base_dir)
+    if pinned is None:
+        if require:
+            raise UpdateError("--require-signature: %s pins no minisign public key "
+                              "(minisign_pub), so nothing can prove who published it" % label)
+        return {"verification": "none", "signature": "none", "key_id": None}
+    key_id, public = pinned
+    if sig_text is None:
+        if not url:
+            return _hash_only(label, sha_pinned, require,
+                              "no signature file was given (--signature)", log_lines, key_id)
+        sig_url = str((cfg or {}).get("signature_url") or (str(url) + ".minisig"))
+        dest = str(archive) + ".minisig"        # inside the caller's staging: always cleaned up
+        try:
+            _download(sig_url, dest, MINISIG_MAX, allowed, None, 30)
+            with io.open(dest, encoding="utf-8") as f:
+                sig_text = f.read()
+        except UpdateError as exc:
+            return _hash_only(label, sha_pinned, require,
+                              "its signature is not available at %s (%s)" % (mask_url(sig_url), exc),
+                              log_lines, key_id)
+        except (OSError, UnicodeDecodeError) as exc:
+            raise UpdateError("the signature of %s cannot be read: %s" % (label, exc))
+    sig = parse_minisign_sig(sig_text)                 # a broken signature is always a refusal
+    if sig["key_id"] != key_id:
+        raise UpdateError("%s is signed by key %s, but the pinned key is %s: the key in the "
+                          "config is not the key that signed this package"
+                          % (label, sig["key_id"], key_id))
+    with io.open(archive, "rb") as f:
+        message = f.read()
+    if sig["alg"] == b"ED":
+        message = hashlib.blake2b(message, digest_size=64).digest()
+    try:
+        verify = minisign_verifier()
+    except UpdateError as exc:
+        return _hash_only(label, sha_pinned, require,
+                          "the signature cannot be checked because %s" % exc, log_lines, key_id)
+    if not verify(public, message, sig["signature"]):
+        raise UpdateError("the minisign signature of %s does not verify with the pinned key %s"
+                          % (label, key_id))
+    if not verify(public, sig["signature"] + sig["trusted"].encode("utf-8"), sig["global"]):
+        raise UpdateError("the minisign global signature of %s does not verify with the pinned key %s "
+                          "(the comment and the signature do not belong together)" % (label, key_id))
+    log.info("%s: signed by minisign key %s (%s)", label, key_id, MINISIGN_ALGS[sig["alg"]])
+    log_lines.append("%s is signed by the pinned minisign key %s" % (label, key_id))
+    return {"verification": MINISIGN_ALGS[sig["alg"]], "signature": "verified", "key_id": key_id}
 
 
 # ---------------------------------------------------------------------------
@@ -485,7 +694,8 @@ def install_release(store, rules_src_dir, meta):
     m["schema"] = 2
     m["active"] = name
     m["package"] = {"name": name, "sha256": meta.get("archive_sha256") or "",
-                    "signature": "unverified",
+                    "signature": meta.get("signature") or "unverified",
+                    "key_id": meta.get("signature_key_id"),
                     "verified": bool(meta.get("verified")),
                     "verification": meta.get("verification", "none")}
     m.setdefault("sources", {})
@@ -527,15 +737,35 @@ def prune(store, keep=KEEP_RELEASES):
 # channels
 # ---------------------------------------------------------------------------
 
-def channel_bundle(store, path, expected_sha256, allow_unverified, log_lines):
-    """--update-from-bundle FILE: the same package the project publishes, offline."""
+def channel_bundle(store, path, expected_sha256, allow_unverified, log_lines,
+                   sig_path=None, require=False):
+    """--update-from-bundle FILE: the same package the project publishes, offline.
+
+    A --signature FILE is checked against the key pinned in sources.json, which is how
+    an offline install stays a VERIFIED install: the key is the anchor, the zip only
+    has to prove that the pinned key signed exactly these bytes."""
     if not os.path.isfile(path):
         raise UpdateError("the bundle file was not found: %s" % path)
     archive_sha = sha256_file(path)
     if expected_sha256 and archive_sha != expected_sha256.lower():
         raise UpdateError("the bundle's sha256 is %s but --package-sha256 says %s: refused"
                           % (archive_sha, expected_sha256.lower()))
-    verified = bool(expected_sha256)
+    cfg = store.load_sources_config()
+    pkg = cfg.get("package_source") if isinstance(cfg.get("package_source"), dict) else {}
+    sig_text = None
+    if sig_path:
+        try:
+            with io.open(sig_path, encoding="utf-8") as f:
+                sig_text = f.read()
+        except (OSError, UnicodeDecodeError) as exc:
+            raise UpdateError("the --signature file %s cannot be read: %s" % (sig_path, exc))
+        if not (pkg.get("minisign_pub") or pkg.get("minisign_pub_file")):
+            raise UpdateError("--signature has nothing to check against: pin the key as "
+                              "package_source.minisign_pub in %s (a signature by an unknown key "
+                              "proves nothing)" % store.sources)
+    sig = check_signature("the bundle", pkg, os.path.dirname(store.sources), path, None, None,
+                          bool(expected_sha256), log_lines, require=require, sig_text=sig_text)
+    verified = sig["verification"] != "none" or bool(expected_sha256)
     if not verified:
         gate_unverified(allow_unverified, "a bare bundle file has no signature: only its own "
                                           "internal hashes are known")
@@ -576,7 +806,10 @@ def channel_bundle(store, path, expected_sha256, allow_unverified, log_lines):
         names = [rel for rel, _p in collect_rules(staging) if rel != "manifest.json"]
         meta = {"release": "bundle-" + archive_sha[:12], "source": "bundle",
                 "archive_sha256": archive_sha, "verified": verified,
-                "verification": "sha256-pinned" if verified else "none", "count": len(names)}
+                "verification": (sig["verification"] if sig["verification"] != "none"
+                                 else ("sha256-pinned" if expected_sha256 else "none")),
+                "signature": sig["signature"], "signature_key_id": sig["key_id"],
+                "count": len(names)}
         pkg = pm.get("package") if isinstance(pm.get("package"), dict) else {}
         nm = str(pkg.get("name") or "").strip()
         if NAME_RE.match(nm):
@@ -595,7 +828,7 @@ def gate_unverified(allow_unverified, why):
                           "\"verified\": false in the manifest." % why)
 
 
-def channel_upstream(store, only, allow_unverified, log_lines, _download=download):
+def channel_upstream(store, only, allow_unverified, log_lines, _download=download, require=False):
     """--update-from-upstream: sync the sources pinned in sources.json (full commit
     SHA + pinned archive sha256; a branch is refused before any request).
 
@@ -618,6 +851,7 @@ def channel_upstream(store, only, allow_unverified, log_lines, _download=downloa
     rules_stage = os.path.join(merge, "rules")
     os.makedirs(rules_stage)
     failed, synced = [], []
+    verifs, key_ids = [], []                 # per synced source: how it was verified
     try:
         for src in cfg:
             name = str(src.get("name") or "").strip()
@@ -647,6 +881,11 @@ def channel_upstream(store, only, allow_unverified, log_lines, _download=downloa
                 url = "https://github.com/%s/archive/%s.zip" % (repo, commit)
                 got = _download(url, os.path.join(staging, name + ".zip"),
                                 MAX_DOWNLOAD, allowed, want_sha, 30)
+                sig = check_signature("source %s" % name, src, os.path.dirname(store.sources),
+                                      os.path.join(staging, name + ".zip"), url, allowed, True,
+                                      log_lines, require=require, _download=_download)
+                verifs.append(sig["verification"])
+                key_ids.append(sig["key_id"])
                 inner = os.path.join(staging, name)
                 written = safe_extract_zip(os.path.join(staging, name + ".zip"), inner)
                 found = collect_rules(inner)
@@ -678,9 +917,20 @@ def channel_upstream(store, only, allow_unverified, log_lines, _download=downloa
         for rel, path in staged:
             fingerprint.update(rel.encode("utf-8"))
             fingerprint.update(sha256_file(path).encode("ascii"))
+        signed = [v for v in verifs if v.startswith("minisign")]
+        distinct = set(verifs)
+        if len(signed) == len(verifs) and len(distinct) == 1:
+            verification, signature = distinct.pop(), "verified"
+        elif len(signed) == len(verifs):
+            verification, signature = "minisign-ed25519 (mixed algs)", "verified"
+        else:
+            verification = "sha256-pinned"
+            signature = "not-checked" if any(v == "sha256-pinned" for v in verifs) else "none"
+        only_key = key_ids[0] if signed and len(signed) == len(verifs) and len(set(key_ids)) == 1 else None
         meta = {"release": "upstream-%s-%s" % (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()),
                                                fingerprint.hexdigest()[:8]),
-                "source": "upstream", "verified": True, "verification": "sha256-pinned",
+                "source": "upstream", "verified": True, "verification": verification,
+                "signature": signature, "signature_key_id": only_key,
                 "count": len(staged), "synced": synced, "failed": failed}
         install_release(store, merge, meta)
         return synced, failed
@@ -702,31 +952,39 @@ def carry_over(prev_rules, rules_stage, source):
     return out
 
 
-def channel_project(store, allow_unverified, log_lines, _download=download):
-    """--update-signatures: the project's own signed package, URL pinned in sources.json."""
+def channel_project(store, allow_unverified, log_lines, _download=download, require=False):
+    """--update-signatures: the project's own package - URL, pinned sha256 and/or a
+    pinned minisign key, all of them from sources.json."""
     cfg = store.load_sources_config()
     pkg = cfg.get("package_source")
     if not isinstance(pkg, dict) or not pkg.get("url"):
         raise UpdateError("the project package channel is not configured yet: add package_source "
-                          "{url, sha256} to %s once the signed package exists (OPEN_QUESTIONS #13)"
-                          % store.sources)
+                          "{url, sha256, minisign_pub} to %s once the signed package exists "
+                          "(OPEN_QUESTIONS #13)" % store.sources)
     url = str(pkg["url"])
     want_sha = str(pkg.get("sha256") or "").lower()
-    verified = bool(want_sha)
-    if not verified:
-        gate_unverified(allow_unverified, "package_source has no sha256 and the signature scheme "
-                                          "is not implemented yet")
+    has_key = bool(pkg.get("minisign_pub") or pkg.get("minisign_pub_file"))
+    if not (want_sha or has_key):
+        gate_unverified(allow_unverified, "package_source pins neither a sha256 nor a minisign "
+                                          "public key (minisign_pub)")
+    allowed = ALLOWED_HOSTS | set(cfg.get("allowed_hosts") or [])
     staging = tempfile.mkdtemp(prefix="project-")
     try:
         dest = os.path.join(staging, "package.zip")
-        got = _download(url, dest, MAX_DOWNLOAD, ALLOWED_HOSTS | set(cfg.get("allowed_hosts") or []),
-                        want_sha or None, 30)
+        got = _download(url, dest, MAX_DOWNLOAD, allowed, want_sha or None, 30)
+        sig = check_signature("the project package", pkg, os.path.dirname(store.sources), dest,
+                              url, allowed, bool(want_sha), log_lines, require=require,
+                              _download=_download)
+        if want_sha:
+            log_lines.append("package %s matches the pinned sha256 %s"
+                             % (os.path.basename(url), got[:12]))
         written = safe_extract_zip(dest, staging)
-        log_lines.append("package %s verified by the pinned sha256 %s"
-                         % (os.path.basename(url), got[:12]))
         meta = {"release": "project-" + got[:12], "source": "project",
-                "archive_sha256": got, "verified": verified,
-                "verification": "sha256-pinned" if verified else "none"}
+                "archive_sha256": got,
+                "verified": sig["verification"] != "none" or bool(want_sha),
+                "verification": (sig["verification"] if sig["verification"] != "none"
+                                 else ("sha256-pinned" if want_sha else "none")),
+                "signature": sig["signature"], "signature_key_id": sig["key_id"]}
         return install_release(store, staging, meta)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
@@ -761,12 +1019,22 @@ def status(store):
                 rel_doc = json.load(f)
         except (OSError, ValueError):
             rel_doc = None
+    pkg = (m.get("package") or {})
+
+    def field(name):
+        """Every release carries its own RELEASE.json; the manifest's "package" block
+        describes the last package that was INSTALLED, which after a rollback is not
+        the active one - so the release's own record has to win here."""
+        value = (rel_doc or {}).get(name)
+        return value if value is not None else pkg.get(name)
+
     return {"present": bool(active), "active": active,
             "rules": (rel_doc or {}).get("count"),
             "verified": (rel_doc or {}).get("verified") if (rel_doc or {}).get("verified") is not None
-                        else (m.get("package") or {}).get("verified"),
-            "verification": (rel_doc or {}).get("verification") or
-                            (m.get("package") or {}).get("verification"),
+                        else pkg.get("verified"),
+            "verification": field("verification"),
+            "signature": field("signature"), "key_id": field("signature_key_id"),
+            "signature_library": have_cryptography(),
             "updated": ((m.get("sources") or {}).get((rel_doc or {}).get("source", ""), {}) or {}).get("updated"),
             "failed": m.get("failed") or [], "releases": [r.get("name") for r in (m.get("releases") or [])],
             "manifest_generated": m.get("generated")}
@@ -793,6 +1061,12 @@ def build_parser():
     ver = ap.add_argument_group("verification")
     ver.add_argument("--package-sha256", metavar="HEX",
                      help="out-of-band sha256 of the bundle/archive: what makes an update VERIFIED")
+    ver.add_argument("--signature", metavar="FILE",
+                     help="with --update-from-bundle: the package's .minisig file, checked against "
+                          "the minisign_pub key pinned in sources.json (offline verified install)")
+    ver.add_argument("--require-signature", action="store_true",
+                     help="refuse anything the pinned minisign key did not sign: no falling back "
+                          "to a pinned sha256, no working without the 'cryptography' package")
     ver.add_argument("--allow-unverified", action="store_true",
                      help="accept a package nothing can verify (loudly; the manifest records \"verified\": false)")
     ver.add_argument("--only", metavar="SOURCE", help="with --update-from-upstream: only this source")
@@ -817,6 +1091,16 @@ def main(argv=None):
     if args.package_sha256 and not re.match(r"^[0-9a-fA-F]{64}$", args.package_sha256):
         print("--package-sha256 must be 64 hex characters")
         return EXIT_CONFIG
+    if args.signature and not args.update_from_bundle:
+        print("--signature belongs with --update-from-bundle (it is the .minisig of that archive)")
+        return EXIT_CONFIG
+    if args.require_signature and args.update_from_bundle and not args.signature:
+        print("--require-signature with --update-from-bundle needs the package's signature: "
+              "pass --signature FILE")
+        return EXIT_CONFIG
+    if args.require_signature and args.allow_unverified:
+        print("--require-signature and --allow-unverified contradict each other")
+        return EXIT_CONFIG
     try:
         store.ensure()
         if args.rules_path:
@@ -831,13 +1115,16 @@ def main(argv=None):
         if args.update_from_bundle:
             name = channel_bundle(store, args.update_from_bundle,
                                   (args.package_sha256 or "").lower() or None,
-                                  args.allow_unverified, log_lines)
+                                  args.allow_unverified, log_lines, sig_path=args.signature,
+                                  require=args.require_signature)
             print("Installed and activated release '%s'." % name)
         elif args.update_signatures:
-            name = channel_project(store, args.allow_unverified, log_lines)
+            name = channel_project(store, args.allow_unverified, log_lines,
+                                   require=args.require_signature)
             print("Installed and activated release '%s'." % name)
         elif args.update_from_upstream:
-            updated, failed = channel_upstream(store, args.only, args.allow_unverified, log_lines)
+            updated, failed = channel_upstream(store, args.only, args.allow_unverified, log_lines,
+                                               require=args.require_signature)
             for u in updated:
                 print("Updated: %s" % u)
             for fl in failed:

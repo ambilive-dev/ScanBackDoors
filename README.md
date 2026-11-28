@@ -488,14 +488,29 @@ python3 updater.py --rollback-signatures            # make the previous release 
 | `--status` | print the active release, its rule count, verification and any failed sources as JSON |
 | `--rules-path` | print the `rules` folder of the active release (exit 1 when nothing is installed) — what you pass to `scan_backdoors.py --yara-rules` |
 | `--package-sha256 HEX` | out-of-band sha256 of the archive; with it the update is **verified**, without it the updater refuses |
+| `--signature FILE` | with `--update-from-bundle`: the package's `.minisig` file, checked against the key pinned as `package_source.minisign_pub` — the offline path to a signature-verified install |
+| `--require-signature` | trust only what a pinned minisign key signed: no falling back to a pinned sha256, and it will not run without the optional `cryptography` package |
 | `--allow-unverified` | accept a package nothing can verify — loudly, and the manifest records `"verified": false` |
 | `--only SOURCE` | with `--update-from-upstream`: sync only this source (the others are carried over) |
 | `--data-dir DIR` | data folder (default: `%SBD_DATA_DIR%`, otherwise `~/.scan_backdoors`) |
 | `--version` | print the bundle version |
 
-**What one update does**: download (streamed, size-capped) → check the pinned sha256 → unpack safely (only `.yar`/`.yara`/license files, zip-slip / symlink / compression-bomb guards, nothing outside the staging folder) → compile every rule file in a separate subprocess with its own timeout (`engines/yara_check.py`) → move the staged release into place atomically → switch the `ACTIVE` pointer → rewrite the manifest. Any failure at any step leaves the previous release active; a source that fails during `--update-from-upstream` keeps its rules.
+**What one update does**: download (streamed, size-capped) → check the pinned sha256 → check the minisign signature when a key is pinned → unpack safely (only `.yar`/`.yara`/license files, zip-slip / symlink / compression-bomb guards, nothing outside the staging folder) → compile every rule file in a separate subprocess with its own timeout (`engines/yara_check.py`) → move the staged release into place atomically → switch the `ACTIVE` pointer → rewrite the manifest. Any failure at any step leaves the previous release active; a source that fails during `--update-from-upstream` keeps its rules.
 
-**Trust model**: an update is only trusted when its archive sha256 is pinned (in `sources.json` or given with `--package-sha256`). A project package (and any `--update-from-bundle` file) must carry its own `manifest.json` declaring every rule file with its sha256 — an undeclared rule file makes the whole package refused. An upstream commit zip has no manifest of its own: there the pinned archive sha256 is the whole trust, which is why pinning is mandatory. Signature verification (`minisign`/`cosign`) is planned and not implemented; until then "verified" means "matches a pinned hash", and `--allow-unverified` exists as an explicit, logged escape hatch.
+**Trust model**: the strongest anchor is a pinned **minisign public key** — the updater then activates only a package whose bytes that key signed (`verification: "minisign-ed25519"`, or `minisign-ed25519-prehashed` for `minisign -prehash` output). A pinned **archive sha256** (in `sources.json` or given with `--package-sha256`) is the weaker anchor: it proves the file did not change since you pinned it, not who made it. Pin both while a channel is young; when both are pinned, both are checked. A signature that is present and wrong is always a refusal — never a quiet downgrade to the hash. `--allow-unverified` remains the explicit, logged escape hatch (`"verified": false` in the manifest).
+
+A **package manifest is mandatory** for a project package (and any `--update-from-bundle` file): it must declare every rule file with its sha256, and an undeclared rule file makes the whole package refused. An upstream commit zip carries no manifest of its own, so there the pinned archive sha256 is the whole trust — which is why pinning is mandatory.
+
+**Signatures need the optional `cryptography` package** (`pip install -r requirements-optional.txt`), and only where a source pins a key: without it the updater keeps working exactly as before by pinned sha256, prints `Signature NOT checked: …` and records `"signature": "not-checked"` in the manifest, so nobody mistakes a hash-only install for a signed one. The `minisign` program itself is never run — the key and the signature file are parsed and verified in-process, and the updater ships a test that checks that parsing against signatures the real `minisign` produced.
+
+**Publishing a signed package** (the project's own channel):
+
+```
+minisign -G -p minisign.pub -s minisign.key        # once, keep the secret key offline
+minisign -S -m rules.zip -x rules.zip.minisig -s minisign.key
+```
+
+then publish both files, and put the single base64 line of `minisign.pub` into `sources.json` as `package_source.minisign_pub` (plus the `sha256` of the archive while the channel is young). Users need nothing but the pinned key: `updater.py` looks for `<url>.minisig` next to the package, or at `package_source.signature_url`.
 
 **Where things live** (under `--data-dir`, created on first run):
 
@@ -507,11 +522,11 @@ signatures/releases/<name>/rules/  the rule files of each release
 logs/updater.log                   rotating log (secrets and tokens are masked)
 ```
 
-`sources.json` is created as a template: `package_source` (the project's own package: `url` + `sha256`) and `upstream` (a list of `{name, repo, commit, archive_sha256, license}`). Pinned hashes and third-party rule licences must be reviewed by a human before anything is put there — see `docs/OPEN_QUESTIONS.md`. Upstream rules are third-party content: review their licence before pinning them, the updater records `license` but does not judge it.
+`sources.json` is created as a template: `package_source` (the project's own package: `url` + `sha256` + `minisign_pub`, optionally `signature_url`) and `upstream` (a list of `{name, repo, commit, archive_sha256, license}`, optionally `minisign_pub`). Pinned hashes, pinned keys and third-party rule licences must be reviewed by a human before anything is put there — see `docs/OPEN_QUESTIONS.md`. A pinned key is the anchor of the whole scheme: replacing it in this file is what replaces who you trust, so treat this file like a config of trust, not like settings. Upstream rules are third-party content: review their licence before pinning them, the updater records `license` but does not judge it.
 
 **Using the installed rules**: `python3 src/scan_backdoors.py /path/to/site --yara-rules "$(python3 src/updater.py --rules-path)"`. The GUI does this automatically: when a release is installed, scans pass its rules folder to the scanner (a path the browser page can never influence), and the **Engines** tab shows the active package with *Update signatures* and *Roll back* buttons.
 
-**Compile check needs `yara-python`** (`pip install yara-python`): without it the updater refuses to activate a package it cannot compile-check. Exit codes: `0` everything updated, `1` usage/config error, `3` PARTIAL (at least one upstream source failed — see the manifest), `4` verification or network failure (the previous release is unchanged).
+**Compile check needs `yara-python`** (`pip install yara-python`): without it the updater refuses to activate a package it cannot compile-check. **Signature check needs `cryptography`** (optional, same file): without it a pinned key cannot be honoured and the update falls back to its pinned sha256 — visibly (see above), or not at all with `--require-signature`. Exit codes: `0` everything updated, `1` usage/config error, `3` PARTIAL (at least one upstream source failed — see the manifest), `4` verification or network failure (the previous release is unchanged).
 
 ---
 

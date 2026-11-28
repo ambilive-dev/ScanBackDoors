@@ -70,6 +70,16 @@ def have_yara():
         return False
 
 
+def have_cryptography():
+    """True when the optional 'cryptography' package is importable, i.e. whether a
+    minisign signature can really be checked in this run. Never imported here."""
+    import importlib.util
+    try:
+        return importlib.util.find_spec("cryptography") is not None
+    except (ImportError, ValueError):
+        return False
+
+
 def data_dir():
     """The data folder the tools use under this harness (created when needed): the
     rule cache, the baseline cache, the GUI whitelist, the installed rule releases."""
