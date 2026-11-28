@@ -5,6 +5,60 @@ version for all components; it is written once in `src/version.py` and a
 release is a tag with that number.
 
 ## Unreleased
+- **CMS audit** (TZ v2 Sprint 3): three new passes over *what is installed* instead of what is
+   inside a file, all off by default so an ordinary scan is byte-for-byte what it was.
+   `--inventory` lists the CMS and its components (WordPress core/plugins/mu-plugins/themes,
+   Joomla version/extensions) with only the version each component *declares*; a component
+   without one is reported as unauditable, never as clean. `--check-integrity` compares WordPress
+   core files with the official checksums from `api.wordpress.org` and turns a modified core file
+   or a PHP file the release does not ship into an ordinary `[CRITICAL]` finding on that file
+   (a missing file is reported in the integrity section - there is nothing to quarantine;
+   `readme.html`/`license.txt`/`wp-config-sample.php` are translated by distributors and never
+   suspicious; plugins and themes have no upstream checksums, so they have no reference file).
+   `--audit-cve` reports the known vulnerabilities of the inventoried components from a local
+   database (`--vuln-db`, JSON schema 2, shipped empty on purpose) and - with `--online` - from
+   `api.wpvulnerability.com`; they are a section of their own in every format (JSON
+   `vulnerabilities`, `Vulnerabilities` sheet in XLSX, a separate `<report>-vulnerabilities.csv`
+   next to the findings CSV - never a block inside it, because that file is parsed by the GUI and
+   by other tools as findings, SARIF results with `ruleId` = CVE)
+   and are never offered for quarantine or delete. `--online` is what opens the door: it says
+   before the first request that the WordPress version and the component slugs/versions leave the
+   machine, works over HTTPS to two pinned hosts with a redirect re-check, a per-run request
+   budget and a 24-hour cache in the data folder, so the next run of the same site is offline;
+   without it the report states what could not be checked. A CVE changes the exit code only with
+   `--fail-on {critical,high,medium}` (code `4`), and never when the verdict was undecidable.
+   If the integrity pass flags the file the CMS version was read from, all verdicts in that run
+   drop to low confidence - a hacked site can lie about its version. In the GUI the audit is four
+   ticks in a new *5. CMS audit* card (all off by default; the network is a separate tick) and the
+   answers go to a fourth bottom panel tab **Vulnerabilities** - component, version, CVE, CVSS,
+   severity, KEV, fixed-in, confidence, source, sortable and KEV-filterable - where no file action
+   is offered at all: the verdicts have no checkbox and Quarantine/Delete/Mass cleanup do not reach
+   them. Hostile manifests are parsed
+   under size caps with `DOCTYPE`/`ENTITY` refused, no site PHP is executed, symlinks are not
+   followed and nothing is written into the site. New engines: `engines/versions.py`
+   (PHP-style version comparison, no false "not affected"), `engines/inventory.py`,
+   `engines/cms_api.py`, `engines/integrity_wp.py`, `engines/vuln_engine.py`; tests:
+   `tests/test_versions.py`, `test_inventory.py`, `test_cms_api.py`, `test_integrity_wp.py`,
+   `test_vuln_engine.py`, `test_audit_cli.py` (which traps `socket` to prove a default run and an
+   audit without `--online` never reach the network) and `test_gui_audit.py`.
+- Signature updates can now be verified by **who published the package**, not only by
+  "the bytes did not change": `updater.py` checks the [minisign](https://github.com/jedisct1/minisign)
+  format (Ed25519) against a public key pinned in `sources.json` (`package_source.minisign_pub`,
+  or `minisign_pub_file` / per-upstream `minisign_pub`), looking for `<url>.minisig` next to the
+  package or at `signature_url`. Both of minisign's algorithms are understood (`Ed` signs the
+  file, `ED` signs its BLAKE2b-512), the signature's key id must be the pinned one, and both the
+  file signature and the global signature have to verify - a signature that is present and wrong
+  is a refusal, never a downgrade to the hash. `--signature FILE` brings the same property to an
+  offline `--update-from-bundle` install. Checking uses the optional `cryptography` package
+  (`requirements-optional.txt`), imported inside one function and only when a source pins a key:
+  without it the updater keeps working by pinned sha256 and says so - `Signature NOT checked: …`
+  in the output, `"signature": "not-checked"` in the manifest - while `--require-signature`
+  refuses instead of falling back. `--status` reports `signature`, `key_id` and
+  `signature_library`; the GUI's Engines card shows "signed by minisign key …" or warns that the
+  pinned signature went unchecked. The `minisign` binary is never executed; the format handling
+  is tested against signatures the real `minisign` produced (fixtures from its author's reference
+  port, jedisct1/go-minisign). Key generation and publication remain the owner's decision
+  (OPEN_QUESTIONS #13) - `minisign -G` / `minisign -S`, recipe in the README.
 - One data folder (OPEN_QUESTIONS #3): everything the tools keep between runs now lives in
    `$SBD_DATA_DIR` (or `~/.scan_backdoors`) - the `.yarac` rule cache (`<data>/yarac`),
    the whitelist the GUI appends to (`<data>/whitelist.txt`), the Joomla baseline cache

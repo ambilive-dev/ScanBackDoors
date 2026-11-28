@@ -42,15 +42,24 @@ except ImportError:                        # a single uploaded file still has to
 try:                                       # extra detection engines: engines/ lives in the repo root
     from engines.base_engine import ScanCtx
     from engines.yara_engine import build_yara_engine, collect_rule_files
+    from engines import inventory as inv_api
+    from engines import vuln_engine as vuln_api
+    from engines import integrity_wp as integ_api
+    from engines import cms_api as audit_net_api
 except ImportError:                        # run from another folder: put the repo root on the path
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     try:
         from engines.base_engine import ScanCtx
         from engines.yara_engine import build_yara_engine, collect_rule_files
+        from engines import inventory as inv_api
+        from engines import vuln_engine as vuln_api
+        from engines import integrity_wp as integ_api
+        from engines import cms_api as audit_net_api
     except ImportError:                    # a single uploaded file has no engines/: YARA stays off
         ScanCtx = None
         build_yara_engine = None
         collect_rule_files = None
+        inv_api = vuln_api = integ_api = audit_net_api = None
 
 # --self-test: the same four samples the test suite plants (tests/payloads/*.b64),
 # sealed here so a single uploaded file can verify itself. They are unsealed only
@@ -98,6 +107,9 @@ SEV_OBF = "[OBFUSCATED]"
 SEV_WARN = "[WARNING]"
 SEV_RANK = {SEV_CRIT: 0, SEV_OBF: 1, SEV_WARN: 2}
 SEV_SARIF = {SEV_CRIT: "error", SEV_OBF: "warning", SEV_WARN: "note"}
+# a CVE has no severity token, so it needs its own mapping to the SARIF levels
+CVE_SARIF_LEVEL = {"critical": "error", "high": "error", "medium": "warning",
+                   "low": "note", "none": "none", "unknown": "note"}
 DEFAULT_WEIGHT = {SEV_CRIT: 10, SEV_OBF: 3, SEV_WARN: 1}
 SCORE_CAP = {SEV_CRIT: 200, SEV_OBF: 45, SEV_WARN: 9}   # WARNING alone never gives MEDIUM (threshold is 10)
 HIGH_SCORE = 25      # >= HIGH
@@ -1243,6 +1255,22 @@ def csv_safe(v):
     return "'" + v if v[:1] in ("=", "+", "-", "@") else v
 
 
+# The vulnerability section/columns. Deliberately not the columns of the findings
+# table: a CVE has no line, no snippet and nothing to delete.
+VULN_CSV_HEADER = ["CVE", "CVSS", "Severity", "Known exploited", "Component", "Type",
+                   "Component version", "Version source", "Fixed in", "Confidence",
+                   "Source", "Component folder", "Summary"]
+
+
+def vuln_csv_row(row):
+    return [row.get("cve") or "", row.get("cvss") if row.get("cvss") is not None else "",
+            row.get("severity") or "", "yes" if row.get("kev") else "no",
+            row.get("component") or "", row.get("type") or "",
+            row.get("component_version") or "", row.get("version_source") or "",
+            row.get("fixed_in") or "", row.get("confidence") or "", row.get("source") or "",
+            row.get("path") or "", row.get("summary") or ""]
+
+
 def write_csv(path, results):
     with io.open(path, "w", newline="", encoding="utf-8-sig", errors="replace") as f:
         w = csv.writer(f)
@@ -1254,13 +1282,70 @@ def write_csv(path, results):
                             label, csv_safe(snip), r["size"], fmt_time(r["mtime"]), "No", r["sha256"]])
 
 
-def write_json(path, results, stats):
+def vulnerabilities_csv_path(csv_path):
+    """Where the vulnerability table goes when --csv is also asked for.
+
+    Not a block appended to the findings CSV: that file is read back by the GUI
+    and by other people's tools with a header-first parser, and a second table in
+    it would be read as malformed findings. An outdated plugin is a different kind
+    of answer, so it comes as a different file.
+    """
+    base, ext = os.path.splitext(csv_path)
+    if not ext or len(ext) > 6:
+        ext = ".csv"
+    return base + "-vulnerabilities" + ext
+
+
+def write_vulnerabilities(path, vulns):
+    """The vulnerability verdicts as their own CSV (the standalone form)."""
+    with io.open(path, "w", newline="", encoding="utf-8-sig", errors="replace") as f:
+        w = csv.writer(f)
+        w.writerow(VULN_CSV_HEADER)
+        for row in vulns:
+            w.writerow([csv_safe(v) if isinstance(v, str) else
+                        ("" if v is None else v) for v in vuln_csv_row(row)])
+
+
+def audit_for_report(audit):
+    """The audit as JSON-safe data for --json/--xlsx.
+
+    `verified_paths` is the internal list of files proven identical to the release
+    (thousands of strings, useful only inside this run): it is replaced by a count.
+    """
+    if not audit:
+        return None
+    data = {"inventory": audit.get("inventory_summary"),
+            "inventory_detail": audit.get("inventory"),
+            "integrity": None, "vulnerabilities": audit.get("vulnerabilities") or [],
+            "vulnerability_summary": audit.get("vuln_summary"),
+            "notes": list(audit.get("notes") or [])}
+    integrity = audit.get("integrity")
+    if integrity:
+        # the rows (paths and hashes) plus the counts: a reader who only wants the
+        # numbers should not have to count arrays, and one who wants the files must
+        # not have to look in two places
+        data["integrity"] = {key: value for key, value in integrity.items()
+                             if key != "verified_paths"}
+        data["integrity"]["summary"] = audit.get("integrity_summary") or {}
+        data["integrity"]["verified_for_skipping"] = len(integrity.get("verified_paths") or ())
+    return data
+
+
+def write_json(path, results, stats, audit=None):
     data = {"version": VERSION, "stats": stats, "files": [{
         "path": r["path"], "score": r["score"], "verdict": r["verdict"], "size": r["size"],
         "modified": fmt_time(r["mtime"]), "mode": r["mode"], "sha256": r["sha256"],
         "counts": r["counts"], "hidden_hits": r["hidden"],
         "hits": [{"severity": h[0], "line": h[1], "signature": h[2], "snippet": h[3]} for h in r["hits"]],
     } for r in results]}
+    extra = audit_for_report(audit)
+    if extra:
+        data["inventory"] = extra.pop("inventory_detail", None)
+        data["inventory_summary"] = extra.pop("inventory", None)
+        data["integrity"] = extra.pop("integrity", None)
+        data["vulnerabilities"] = extra.pop("vulnerabilities", [])
+        data["vulnerability_summary"] = extra.pop("vulnerability_summary", None)
+        data["audit_notes"] = extra.pop("notes", [])
     with io.open(path, "w", encoding="utf-8", errors="replace") as f:
         json.dump(data, f, ensure_ascii=False, indent=1)
 
@@ -1272,13 +1357,17 @@ def uri_of(p):
     return ("file:///" if re.match(r"^[A-Za-z]:/", p) else "file://") + p
 
 
-def write_sarif(path, results, stats):
+def write_sarif(path, results, stats, audit=None):
     """SARIF 2.1.0 report so the findings can be imported into code-scanning
     tools (GitHub code scanning, Azure DevOps, CodeQL CLI upload).
 
     One result per finding: the rule is the signature label, the level follows
     the severity (CRITICAL -> error, OBFUSCATED -> warning, WARNING -> note),
     the location is the file with the line of the finding when the check has one.
+
+    A vulnerability is a result of its own with `ruleId` = the CVE and the
+    component's folder as its location: a CVE has no line in a file, and the path
+    is site-relative for the same reason the rest of the report is.
     """
     rules, artifacts, sarif_results = {}, [], []
     for r in results:
@@ -1295,6 +1384,24 @@ def write_sarif(path, results, stats):
             sarif_results.append({"ruleId": label, "level": SEV_SARIF[sev],
                                   "message": {"text": message},
                                   "locations": [{"physicalLocation": location}]})
+    for row in (audit or {}).get("vulnerabilities") or []:
+        rule_id = row.get("cve") or ("unpinned-%s-%s" % (row.get("type"), row.get("component")))
+        level = CVE_SARIF_LEVEL.get(row.get("severity") or "unknown", "note")
+        if rule_id not in rules:
+            rules[rule_id] = {"id": rule_id, "name": rule_id,
+                              "shortDescription": {"text": row.get("summary") or rule_id},
+                              "helpUri": "https://www.cve.org/CVERecord?id=%s" % rule_id,
+                              "defaultConfiguration": {"level": level}}
+        component = "%s %s %s" % (row.get("type") or "?", row.get("component") or "?",
+                                  row.get("component_version") or "(version unknown)")
+        message = "%s: %s%s" % (rule_id, component,
+                                " - fixed in %s" % row["fixed_in"] if row.get("fixed_in")
+                                else " - no published fix")
+        entry = {"ruleId": rule_id, "level": level, "message": {"text": message}}
+        if row.get("path"):
+            entry["locations"] = [{"physicalLocation": {
+                "artifactLocation": {"uri": row["path"], "uriBaseId": "%SRCROOT%"}}}]
+        sarif_results.append(entry)
     root = uri_of(stats.get("Scanned folder"))
     doc = {
         "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json",
@@ -1414,7 +1521,7 @@ SEV_STYLE = {SEV_CRIT: 2, SEV_OBF: 3, SEV_WARN: 4}
 VERDICT_STYLE = {"HIGH": 2, "MEDIUM": 3, "LOW": 4}
 
 
-def build_xlsx(path, results, stats):
+def build_xlsx(path, results, stats, audit=None):
     files = [[(h, 1) for h in ("Score", "Verdict", "File", "Size, B", "Modified", "Delete", "SHA-256",
                                "CRITICAL", "OBFUSCATED", "WARNING", "Main signatures")]]
     for r in results:
@@ -1437,9 +1544,19 @@ def build_xlsx(path, results, stats):
         summ.append([k, v])
     if truncated:
         summ.append(["NOTE", "Hits sheet truncated (Excel row limit); use --csv/--json for full data"])
-    write_xlsx(path, [("Files", files[:XLSX_MAX_ROWS], [8, 10, 60, 10, 17, 7, 66, 11, 9, 9, 60]),
-                      ("Hits", hits, [8, 14, 60, 7, 42, 90, 17]),
-                      ("Summary", summ, [28, 50])])
+    sheets = [("Files", files[:XLSX_MAX_ROWS], [8, 10, 60, 10, 17, 7, 66, 11, 9, 9, 60]),
+              ("Hits", hits, [8, 14, 60, 7, 42, 90, 17])]
+    vulns = (audit or {}).get("vulnerabilities") or []
+    if vulns:
+        # a sheet of its own: an outdated component is not a row of the findings
+        # table, and mixing them invites someone to "quarantine" a CVE
+        sheet = [[(h, 1) for h in VULN_CSV_HEADER]]
+        for row in vulns[:XLSX_MAX_ROWS - 1]:
+            sheet.append(list(vuln_csv_row(row)))
+        sheets.append(("Vulnerabilities", sheet,
+                       [16, 6, 9, 15, 26, 10, 16, 14, 10, 11, 16, 34, 60]))
+    sheets.append(("Summary", summ, [28, 50]))
+    write_xlsx(path, sheets)
 
 
 
@@ -1698,6 +1815,237 @@ def chunked(seq, n):
 
 
 # ---------------------------------------------------------------------------
+# 4b) CMS AUDIT - inventory, WordPress integrity, known vulnerabilities
+#
+# This is the only part of the scan that can reach the network, and it does so
+# only when the user asked for it with --online (the warning printed before the
+# first request says exactly which two services see which pieces of data). The
+# engines behind it are engines/inventory.py, engines/integrity_wp.py and
+# engines/vuln_engine.py; this file only decides severity, exit codes and how it
+# is printed.
+# ---------------------------------------------------------------------------
+
+# The weight an integrity verdict contributes to the file's score. A modified
+# core file or a new PHP file inside wp-admin is not a hint, it is the finding.
+INTEGRITY_VERDICTS = {"modified": (SEV_CRIT, 30),
+                      "extra-code": (SEV_CRIT, 40),
+                      "extra-file": (SEV_WARN, 6)}
+
+FAIL_ON_LEVELS = ("critical", "high", "medium")
+
+
+def audit_dirs(args):
+    """(cache folder, local database path) - both in the data folder, never in the site."""
+    root = data_root()
+    return (os.path.join(root, "audit-cache"),
+            os.path.abspath(os.path.expanduser(args.vuln_db)) if args.vuln_db
+            else os.path.join(root, "audit", "vulnerabilities.json"))
+
+
+def audit_notice(online, cache_dir, say):
+    """What --online gives away. Said once, before the first request, in plain words."""
+    if not online:
+        say("audit: no requests will be made; answers cached in %s (one day) are still used "
+            "(add --online to ask the two services)" % cache_dir)
+        return
+    say("audit: ONLINE. This run sends out:")
+    say("  - the WordPress version it found -> api.wordpress.org (official checksums);")
+    say("  - every plugin/theme slug and version it found -> api.wpvulnerability.com.")
+    say("  Nothing else leaves this machine and nothing is uploaded; answers are cached")
+    say("  for a day in %s, so the next run of this site works offline." % cache_dir)
+
+
+def run_integrity(start, inventory, client, notes, say):
+    """WordPress core against the official checksums, or a reason why not."""
+    cms = inventory.get("cms")
+    if cms != "wordpress":
+        say("integrity: implemented for WordPress (a Joomla site is compared with a clean "
+            "distribution through --baseline-dir)")
+        return None
+    version = (inventory.get("cms_version") or {}).get("version") or ""
+    if not audit_net_api.valid_wp_version(version):
+        notes.append("integrity: the WordPress version is unknown, so the official catalogue "
+                     "could not be asked")
+        say("integrity: the WordPress version is unknown - nothing to compare against")
+        return None
+    try:
+        checksums = audit_net_api.core_checksums(client, version)
+    except audit_net_api.OfflineMode:
+        notes.append("integrity: the official checksums of WordPress %s are not cached: "
+                     "run this once with --online" % version)
+        say("integrity: needs --online the first time (the catalogue is then cached for a day "
+            "in the data folder)")
+        return None
+    except audit_net_api.AuditError as exc:
+        notes.append("integrity: %s" % exc)
+        say("integrity: %s" % exc)
+        return None
+    if not checksums:
+        notes.append("integrity: api.wordpress.org has no checksums for WordPress %s" % version)
+        say("integrity: no official checksums exist for WordPress %s" % version)
+        return None
+    report = integ_api.check_core(start, checksums, version=version)
+    got = integ_api.summarize(report)
+    say("integrity: %d file(s) match WordPress %s; modified %d, extra %d, missing %d"
+        % (got["verified"], version, got["modified"], got["extra"], got["missing"]))
+    if got["unreadable"]:
+        say("integrity: %d file(s) could not be hashed (size limit or permissions)"
+            % got["unreadable"])
+    if got["soft"]:
+        say("integrity: %d file(s) differ but do not count as suspicious "
+            "(readme/licence are translated)" % got["soft"])
+    if not report["complete"]:
+        say("integrity: INCOMPLETE - not every core file could be compared")
+    return report
+
+
+def run_cve_audit(inventory, client, db_path, integrity_report, notes, say, online):
+    """Known vulnerabilities of the inventoried components, local first."""
+    if os.path.isfile(db_path):
+        entries, problems = vuln_api.load_database(db_path)
+    else:
+        entries, problems = [], ["the local vulnerability database is not installed (%s)" % db_path]
+    for problem in problems:
+        notes.append("vulnerabilities: %s" % problem)
+    findings, audit_notes = vuln_api.audit(inventory, entries=entries, client=client,
+                                           integrity=integrity_report)
+    notes.extend("vulnerabilities: %s" % n for n in audit_notes)
+    say("vulnerabilities: %d verdict(s) (local database: %d entries%s)"
+        % (len(findings), len(entries), ", service: asked" if online else ", service: not asked"))
+    shown = skipped = 0
+    for row in findings:
+        if row.get("confidence") == "low" and shown >= 5:
+            skipped += 1
+            continue
+        if shown >= 15:
+            skipped += 1
+            continue
+        say("  %-8s %-14s %-12s %s  %s%s" % (
+            row.get("severity") or "?", row.get("cve") or "-",
+            "%s/%s" % (row.get("type"), row.get("component")),
+            row.get("component_version") or "(version unknown)",
+            "KEV " if row.get("kev") else "",
+            ("fixed in %s" % row["fixed_in"]) if row.get("fixed_in") else "no published fix"))
+        shown += 1
+    if skipped:
+        say("  … %d more (the full list is in the report)" % skipped)
+    return findings
+
+
+def cms_audit(start, args, emit):
+    """Everything the CMS audit produces: data for the reports, text for the console.
+
+    The console lines are returned instead of printed: the findings of the file
+    scan come first in the output, and the audit is secondary news.
+    """
+    out = {"inventory": None, "inventory_summary": None, "integrity": None,
+           "integrity_summary": {"checked": False}, "vulnerabilities": [],
+           "vuln_summary": None, "notes": [], "lines": []}
+    if inv_api is None:
+        return out
+    say = out["lines"].append
+    wanted = [name for name, on in (("inventory", args.inventory),
+                                    ("integrity", args.check_integrity),
+                                    ("cve audit", args.audit_cve)) if on]
+    say("=" * 64)
+    say("CMS AUDIT (%s)" % ", ".join(wanted))
+    emit("PHASE", "audit")
+    cache_dir, db_path = audit_dirs(args)
+    online = bool(args.online)
+    client = None
+    if args.check_integrity or args.audit_cve:
+        client = audit_net_api.AuditClient(cache_dir=cache_dir, allow_network=online)
+        audit_notice(online, cache_dir, say)
+    out["inventory"] = inv_api.build_inventory(start)
+    summary = inv_api.summarize(out["inventory"])
+    out["inventory_summary"] = summary
+    name = {"wordpress": "WordPress", "joomla": "Joomla"}.get(summary["cms"], "no supported CMS")
+    say("  CMS: %s%s" % (name, " %s" % summary["cms_version"] if summary["cms_version"]
+                         else " (version unknown)"))
+    if summary["components"]:
+        say("  components: %s" % ", ".join(
+            "%s %d" % (kind, count) for kind, count in sorted(summary["components"].items())))
+    if summary["unknown_versions"]:
+        say("  components without a declared version: %d (reported as unauditable, not as clean)"
+            % summary["unknown_versions"])
+    if args.check_integrity:
+        out["integrity"] = run_integrity(start, out["inventory"], client, out["notes"], say)
+        out["integrity_summary"] = integ_api.summarize(out["integrity"])
+    if args.audit_cve:
+        out["vulnerabilities"] = run_cve_audit(out["inventory"], client, db_path,
+                                               out["integrity"], out["notes"], say, online)
+        out["vuln_summary"] = vuln_api.summarize(out["vulnerabilities"])
+    if client is not None:
+        out["notes"].extend("audit: %s" % note for note in client.notes)
+        say("  requests made: %d, answered from the cache: %d"
+            % (client.requests, client.cache_hits))
+    for note in _collapsed(out["notes"]):
+        say("  note: %s" % note)
+    out["notes"] = _collapsed(out["notes"])
+    return out
+
+
+def _collapsed(notes):
+    """The same complaint from five components is one line with a count."""
+    order, counts = [], {}
+    for note in notes:
+        if note not in counts:
+            counts[note] = 0
+            order.append(note)
+        counts[note] += 1
+    return [note if counts[note] == 1 else "%s (x%d)" % (note, counts[note]) for note in order]
+
+
+def integrity_into_results(results, integrity, start, args):
+    """Integrity verdicts become ordinary findings on the affected file.
+
+    A modified core file must appear in the table with a score and the same
+    actions any other suspicious file has. The weight is added on top of the
+    file's own score, which can exceed the usual cap for its severity: deliberate
+    - a file that is not what WordPress published is never a low-priority file.
+    A missing file cannot be quarantined (there is nothing to act on), so it stays
+    in the integrity section of the report instead of becoming a phantom row.
+    """
+    if not integrity:
+        return 0
+    rows = []
+    for row in integrity.get("modified") or []:
+        rows.append((row["path"], "modified WordPress core file",
+                     "the official %s checksum is %s, the site has %s"
+                     % (integrity.get("version"), row["expected"][:12], row["actual"][:12]),
+                     "modified"))
+    for row in integrity.get("extra") or []:
+        rows.append((row["path"],
+                     "file the official WordPress release does not ship",
+                     "WordPress %s has no %s" % (integrity.get("version") or "?", row["path"]),
+                     "extra-code" if row["php"] else "extra-file"))
+    by_path = {r["path"]: r for r in results}
+    added = 0
+    for rel, label, detail, kind in rows:
+        sev, weight = INTEGRITY_VERDICTS[kind]
+        hit = (sev, 0, label, detail, weight)
+        existing = by_path.get(rel)
+        if existing is not None:
+            existing["hits"].append(hit)
+            existing["counts"][sev] = existing["counts"].get(sev, 0) + 1
+            existing["score"] += weight
+            existing["verdict"] = verdict_of(existing["score"])
+            continue
+        path = os.path.join(start, *rel.split("/"))
+        try:
+            st = os.lstat(path)
+            with open(path, "rb") as fh:
+                sha = hashlib.sha256(fh.read()).hexdigest()
+        except OSError:
+            continue                       # vanished while we looked: nothing to report on
+        result = make_result(rel, st, sha, [hit], args.max_matches)
+        results.append(result)
+        by_path[rel] = result
+        added += 1
+    return added
+
+
+# ---------------------------------------------------------------------------
 # SELF-TEST
 # ---------------------------------------------------------------------------
 
@@ -1780,6 +2128,26 @@ def build_parser():
     ap.add_argument("--yara-timeout", type=float, default=5.0,
                     help="YARA time limit per file in seconds (5): a file that hits the limit is reported "
                          "as a scan gap, never as clean")
+    ap.add_argument("--inventory", action="store_true",
+                    help="inventory the CMS and its components (WordPress/Joomla): what is installed "
+                         "and which version the component declares")
+    ap.add_argument("--check-integrity", action="store_true",
+                    help="compare WordPress core files with the official checksums: modified, extra and "
+                         "missing files; the catalogue is fetched once and cached for a day in the data folder")
+    ap.add_argument("--audit-cve", action="store_true",
+                    help="report the known vulnerabilities of the inventoried components (local database, "
+                         "and with --online also WPVulnerability). They are a section of their own and are "
+                         "never offered for quarantine/delete")
+    ap.add_argument("--online", action="store_true",
+                    help="allow the two pinned services (api.wordpress.org, api.wpvulnerability.com) that "
+                         "--check-integrity/--audit-cve need; without it only the one-day cache and the "
+                         "local database are used, and the scanner says what it could not check")
+    ap.add_argument("--vuln-db",
+                    help="local vulnerability database (JSON, schema 2) for --audit-cve "
+                         "(default: audit/vulnerabilities.json in the data folder)")
+    ap.add_argument("--fail-on", choices=FAIL_ON_LEVELS,
+                    help="exit code 4 when a vulnerability verdict reaches this severity; "
+                         "without it a CVE never changes the exit code")
     ap.add_argument("--workers", type=int, default=0, help="number of processes (0 = auto, 1 = no parallelism)")
     ap.add_argument("--no-progress", action="store_true", help="no progress indicator")
     ap.add_argument("--progress-lines", action="store_true",
@@ -1796,6 +2164,14 @@ def main(argv=None):
         return self_test()
     if args.no_csv:
         args.csv = None
+    audit_wanted = bool(args.inventory or args.check_integrity or args.audit_cve)
+    if audit_wanted and inv_api is None:
+        print("CMS audit: this build has no engines/ package next to it - "
+              "run the scanner from the repository or copy the engines folder too")
+        return 1
+    if args.fail_on and not args.audit_cve:
+        print("--fail-on only means something together with --audit-cve")
+        return 1
     if hasattr(sys.stdout, "reconfigure"):
         try:
             sys.stdout.reconfigure(errors="replace")
@@ -1966,6 +2342,9 @@ def main(argv=None):
         sys.stderr.write("\r" + " " * 60 + "\r")
 
     emit("PHASE", "finish")
+    audit = cms_audit(start, args, emit) if audit_wanted else None
+    if audit and audit.get("integrity"):
+        integrity_into_results(results, audit["integrity"], start, args)
     results = [r for r in results if r["score"] >= args.min_score]
     results.sort(key=lambda r: (-r["score"], r["path"]))
 
@@ -1985,6 +2364,11 @@ def main(argv=None):
                                       label, trim(snip, 120) if snip else ""))
         if r["hidden"]:
             print("   … %d more findings hidden (--max-matches)" % r["hidden"])
+
+    if audit and audit["lines"]:
+        print("")
+        for line in audit["lines"]:
+            print(line)
 
     sev_tot = Counter()
     ver_tot = Counter()
@@ -2021,6 +2405,26 @@ def main(argv=None):
         stats["YARA: rules loaded"] = yara_eng.rules_count if yara_eng is not None else 0
         stats["YARA: files scanned"] = stats_c.get("yara_ok", 0)
         stats["YARA: scan gaps (files not fully scanned)"] = stats_c.get("yara_gap", 0)
+
+    if audit is not None:
+        summary = audit.get("inventory_summary") or {}
+        stats["CMS"] = summary.get("cms", "unknown")
+        stats["CMS version"] = summary.get("cms_version", "")
+        stats["Components inventoried"] = sum((summary.get("components") or {}).values())
+        stats["Components with an unknown version"] = summary.get("unknown_versions", 0)
+        integ = audit.get("integrity_summary") or {}
+        if integ.get("checked"):
+            stats["WordPress core: verified"] = integ["verified"]
+            stats["WordPress core: modified"] = integ["modified"]
+            stats["WordPress core: extra"] = integ["extra"]
+            stats["WordPress core: missing"] = integ["missing"]
+        vsum = audit.get("vuln_summary")
+        if vsum:
+            stats["Vulnerabilities: verdicts"] = vsum["total"]
+            stats["Vulnerabilities: known exploited (KEV)"] = vsum["kev"]
+            stats["Vulnerabilities: unauditable components"] = vsum["low_confidence"]
+        if audit["notes"]:
+            stats["Audit notes"] = len(audit["notes"])
 
     print("\n" + "=" * 64)
     print("STATISTICS")
@@ -2066,16 +2470,22 @@ def main(argv=None):
             write_csv(args.csv, results)
             print("CSV : %s" % os.path.abspath(args.csv))
             emit("FILE", "csv " + os.path.abspath(args.csv))
+            vulns = (audit or {}).get("vulnerabilities") or []
+            if vulns:
+                vpath = vulnerabilities_csv_path(args.csv)
+                write_vulnerabilities(vpath, vulns)
+                print("CVE CSV: %s" % os.path.abspath(vpath))
+                emit("FILE", "vuln_csv " + os.path.abspath(vpath))
         if args.xlsx:
-            build_xlsx(args.xlsx, results, stats)
+            build_xlsx(args.xlsx, results, stats, audit)
             print("XLSX: %s" % os.path.abspath(args.xlsx))
             emit("FILE", "xlsx " + os.path.abspath(args.xlsx))
         if args.json:
-            write_json(args.json, results, stats)
+            write_json(args.json, results, stats, audit)
             print("JSON: %s" % os.path.abspath(args.json))
             emit("FILE", "json " + os.path.abspath(args.json))
         if args.sarif:
-            write_sarif(args.sarif, results, stats)
+            write_sarif(args.sarif, results, stats, audit)
             print("SARIF: %s" % os.path.abspath(args.sarif))
             emit("FILE", "sarif " + os.path.abspath(args.sarif))
     except Exception as e:
@@ -2084,7 +2494,13 @@ def main(argv=None):
     emit("STATS", json.dumps(stats, ensure_ascii=False))
     emit("DONE", str(sev_tot[SEV_CRIT]))
     if sev_tot[SEV_CRIT]:
-        return 2
+        return 2                                # a possible compromise outranks everything else
+    if args.fail_on and audit and audit.get("vulnerabilities"):
+        worst = vuln_api.max_severity(audit["vulnerabilities"])
+        if vuln_api.meets_threshold(audit["vulnerabilities"], args.fail_on):
+            print("ACTION: --fail-on %s: a vulnerability of severity '%s' was found "
+                  "(no file finding was [CRITICAL])" % (args.fail_on, worst))
+            return 4                            # known vulnerabilities reached the bar
     return 3 if (args.strict and stats["Read errors"]) else 0
 
 

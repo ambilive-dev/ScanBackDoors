@@ -70,9 +70,17 @@ DEFAULTS = {
     "max_matches": "60", "min_score": "0", "workers": "0", "exclude_ext": "", "exclude_dir": "",
     "only_critical": False, "no_warnings": False, "no_csv": False, "auto_open": False,
     "clean_permanent": False, "clean_fm": False, "clean_core": False,
+    "audit_inventory": False, "audit_integrity": False, "audit_cve": False, "audit_online": False,
     "ai_enabled": False, "ai_base_url": "http://127.0.0.1:8080/v1", "ai_model": "",
 }
 BOOL_KEYS = {k for k, v in DEFAULTS.items() if isinstance(v, bool)}
+
+# The CMS audit (TZ v2 Sprint 3): setting key -> the scanner flag it turns on.
+# `audit_online` is deliberately not in this list: it never asks for anything by
+# itself, it only permits the requests the other two would make.
+AUDIT_FLAGS = (("audit_inventory", "--inventory"), ("audit_integrity", "--check-integrity"),
+               ("audit_cve", "--audit-cve"))
+AUDIT_ONLINE_FLAG = "--online"
 
 # ------------------------------------------------------------------------------
 # Local AI - review of suspicious files against a localhost model
@@ -540,6 +548,11 @@ class App(object):
         threading.Thread(target=self._refresh_engines, daemon=True).start()
         self.shutdown_cb = None
         self.ai_results = {}                    # rel -> {status, comment}, loaded from the CSV below
+        # the CMS audit of the last scan: {"available", "vulnerabilities", "integrity",
+        # "inventory", "notes"} - a section of its own, never mixed into self.findings
+        self.audit = {"available": False, "vulnerabilities": [], "integrity": {},
+                      "inventory": {}, "notes": [], "source": ""}
+        self.audit_version = 0                  # the browser refetches /api/audit when it changes
         self._active_ai_model = ''                # resolved once per review job, then used for every file
         self._ai_loaded_model_cache = None           # the loaded model, resolved once per process
         self.load_findings()                  # show the previous report right away, if there is one
@@ -705,6 +718,94 @@ class App(object):
                         self.ai_results[rel] = {"status": verdict, "comment": str(row.get("AI Comment", ""))[:AI_COMMENT_MAX]}
                     self.findings.append(row)
             self.findings_version += 1
+
+    # ------------------------------------------------------------ CMS audit
+    AUDIT_TEXT_MAX = 300
+
+    def audit_report_path(self):
+        """The JSON report the audit answer comes from when the user asked for none.
+
+        The audit's verdicts exist only in that section of the report, so a scan with
+        the audit on always writes one - into the data folder, a path of the app that
+        the browser can never influence. The user's own report settings are untouched.
+        """
+        path = Path(self._data_root()) / "audit" / "last-scan.json"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        return str(path)
+
+    @classmethod
+    def _audit_row(cls, row):
+        """One verdict with every string bounded: the words came from a service."""
+        out = {}
+        for key in ("cve", "cms", "component", "type", "component_version", "version_source",
+                    "severity", "fixed_in", "confidence", "source", "path", "summary",
+                    "cvss_vector"):
+            value = row.get(key)
+            out[key] = "" if value is None else str(value)[:cls.AUDIT_TEXT_MAX]
+        score = row.get("cvss")
+        out["cvss"] = float(score) if isinstance(score, (int, float)) and not isinstance(score, bool) else None
+        out["kev"] = bool(row.get("kev"))
+        return out
+
+    def load_audit(self):
+        """Read the audit sections back out of the report the scan just wrote.
+
+        Nothing is re-run and nothing is filled in by hand: when the report has no
+        audit in it (it was not asked for, or an older scanner wrote the file), the
+        tab says there is nothing to show instead of showing something made up.
+        """
+        path = self.report_path("json")
+        if path is None:
+            guess = Path(self.audit_report_path())
+            path = guess if guess.is_file() else None
+        empty = {"available": False, "vulnerabilities": [], "integrity": {},
+                 "inventory": {}, "notes": [], "source": ""}
+        audit = dict(empty)
+        if path is not None:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                data = None
+                self.log_add("Could not read the audit section of the report: %s\n" % exc)
+            if isinstance(data, dict) and ("vulnerabilities" in data or "integrity" in data
+                                           or "inventory_summary" in data):
+                audit = {
+                    "available": True,
+                    "vulnerabilities": [self._audit_row(v) for v in (data.get("vulnerabilities") or [])
+                                        if isinstance(v, dict)][:5000],
+                    "integrity": (data.get("integrity") or {}).get("summary") or {},
+                    "inventory": data.get("inventory_summary") or {},
+                    "notes": [str(note)[:400] for note in (data.get("audit_notes") or [])][:50],
+                    "source": str(path),
+                }
+        with self.lock:
+            self.audit = audit
+            self.audit_version += 1
+        if audit["vulnerabilities"]:
+            self.log_add("\nCMS audit: %d known-vulnerability verdict(s) - they are listed on "
+                         "the Vulnerabilities panel, never as files to quarantine.\n"
+                         % len(audit["vulnerabilities"]))
+
+    def audit_info(self):
+        """Everything the Vulnerabilities panel shows (the verdicts included)."""
+        with self.lock:
+            info = dict(self.audit)
+            info["version"] = self.audit_version
+        info["enabled"] = bool(self.s("audit_inventory") or self.s("audit_integrity")
+                               or self.s("audit_cve"))
+        info["online_allowed"] = bool(self.s("audit_online"))
+        return info
+
+    def audit_badge(self):
+        """The small state-line answer: is there an audit, and how big is it."""
+        with self.lock:
+            audit = self.audit
+            return {"available": audit["available"], "version": self.audit_version,
+                    "vulnerabilities": len(audit["vulnerabilities"]),
+                    "kev": sum(1 for row in audit["vulnerabilities"] if row["kev"])}
 
     @staticmethod
     def _sort_key(row, col):
@@ -1016,7 +1117,22 @@ class App(object):
         yara_rules = self._active_rules_dir()
         if yara_rules and "--yara-rules" in scanner_text:
             cmd.extend(["--yara-rules", yara_rules])
+        # the CMS audit: only what was ticked, and only flags this scanner build knows
+        # (an older one would exit on an unknown option rather than ignore it)
+        audit_flags = [flag for key, flag in AUDIT_FLAGS
+                       if self.s(key) and flag in scanner_text]
+        cmd.extend(audit_flags)
+        if (self.s("audit_online") and any(f in ("--check-integrity", "--audit-cve") for f in audit_flags)
+                and AUDIT_ONLINE_FLAG in scanner_text):
+            cmd.append(AUDIT_ONLINE_FLAG)
+            self.log_add("Note: the audit is allowed to send the WordPress version and the "
+                         "plugin/theme names it finds to api.wordpress.org and "
+                         "api.wpvulnerability.com.\n")
         outputs = [("--xlsx", self.s("xlsx_path")), ("--json", self.s("json_path"))]
+        if audit_flags and not self.s("json_path").strip():
+            # the vulnerability verdicts only exist in the JSON report: the audit
+            # always produces one, in the data folder, whatever the user chose there
+            cmd.extend(["--json", self.audit_report_path()])
         if self.s("no_csv"):
             cmd.append("--no-csv")
         else:
@@ -1103,6 +1219,9 @@ class App(object):
                 raise ApiError("Another job is already running.", 409)
             self.report_files, self.last_stats = {}, None
             self.ai_results = {}
+            self.audit = {"available": False, "vulnerabilities": [], "integrity": {},
+                          "inventory": {}, "notes": [], "source": ""}
+            self.audit_version += 1
             self.scanned_site = str(Path(self.s("site_dir")).expanduser())
             self.findings, self.hidden_done = [], 0
             self.findings_version += 1
@@ -1299,15 +1418,36 @@ class App(object):
         verified = (rel_doc or {}).get("verified")
         if verified is None:
             verified = pkg.get("verified")
+
+        def field(name):
+            """RELEASE.json is what was checked when this release was installed; the
+            manifest's "package" block describes the last INSTALLED one, which after a
+            rollback is not the active release."""
+            value = (rel_doc or {}).get(name)
+            return value if value is not None else pkg.get(name)
+
         return {"present": bool(active), "active": active_name,
                 "rules": (rel_doc or {}).get("count") if rel_doc else (0 if not active else None),
                 "verified": verified,
-                "verification": (rel_doc or {}).get("verification") or pkg.get("verification"),
+                "verification": field("verification"),
+                "signature": field("signature"), "key_id": field("signature_key_id"),
+                "signature_library": self._have_cryptography(),
                 "updated": src.get("updated"), "manifest_generated": (manifest or {}).get("generated"),
                 "failed": (manifest or {}).get("failed") or [],
                 "releases": [r.get("name") for r in ((manifest or {}).get("releases") or [])],
                 "data_dir": sig_dir,
                 "tool": os.path.isfile(str(HERE / "updater.py"))}
+
+    @staticmethod
+    def _have_cryptography():
+        """Whether a minisign signature could be checked at all here. The checking is
+        updater.py's business; the card only has to say honestly when it is impossible.
+        The package itself is never imported by the GUI."""
+        try:
+            import importlib.util
+            return importlib.util.find_spec("cryptography") is not None
+        except (ImportError, ValueError):
+            return False
 
     def _updater_cmd(self, action_flags):
         tool = str(HERE / "updater.py")
@@ -1995,8 +2135,12 @@ class App(object):
         """Service lines of the scanner (--progress-lines): they do not go to the log."""
         if tag == "PHASE":
             job["indeterminate"] = True
-            job["text"] = {"baseline": "Building the clean Joomla baseline…", "walk": "Collecting the file list…",
-                           "finish": "Generating the report…", "clean": "Cleaning files…"}.get(payload, "Working…")
+            job["text"] = {"baseline": "Building the clean Joomla baseline…",
+                           "walk": "Collecting the file list…",
+                           "finish": "Generating the report…",
+                           "clean": "Cleaning files…",
+                           "audit": "Auditing the CMS (inventory, integrity, known vulnerabilities)…"
+                           }.get(payload, "Working…")
         elif tag == "PROGRESS":
             try:
                 done, total = (int(x) for x in payload.split())
@@ -2065,6 +2209,28 @@ class App(object):
         self.status = msg
         self.log_add("\n" + msg + "\n")
         self.load_findings()
+        self.load_audit()
+        integ = (self.audit.get("integrity") or {})
+        vulns = self.audit.get("vulnerabilities") or []
+        if integ.get("checked"):
+            extra = ("WordPress core: %d verified, %d modified, %d extra, %d missing."
+                     % (integ.get("verified", 0), integ.get("modified", 0), integ.get("extra", 0),
+                        integ.get("missing", 0)))
+            self.log_add(extra + "\n")
+            if integ.get("modified") or integ.get("extra"):
+                self.notify("warn", "WordPress integrity", extra +
+                            "\n\nModified and unexpected core files are in the findings table; "
+                            "they are the files to look at first.")
+        if vulns:
+            kev = sum(1 for row in vulns if row["kev"])
+            self.log_add("Known vulnerabilities: %d (of which exploited in the wild: %d). "
+                         "These are not files to delete: update the components.\n" % (len(vulns), kev))
+            self.notify("info", "Known vulnerabilities",
+                        "The audit reported %d known vulnerabilit%s of the installed components%s.\n"
+                        "They are on the Vulnerabilities panel and in the report, and are never "
+                        "quarantined or deleted - the fix is to update the component."
+                        % (len(vulns), "y" if len(vulns) == 1 else "ies",
+                           (" (%d already exploited in the wild)" % kev) if kev else ""))
         if stopped or report_error:
             return
         if not valid or code not in (0, 2):
@@ -2214,6 +2380,7 @@ class App(object):
                     "reports": self.reports_info(), "findings_version": self.findings_version,
                     "findings_total": len(self.findings), "notice": self.notice, "ai_stats": ai_stats,
                     "engines": list(self.engines), "baseline": dict(self.baseline_view),
+                    "audit": self.audit_badge(),
                     "signatures": self.signatures_status()}
 
     # ------------------------------------------------------------ server-side file browser
@@ -2400,6 +2567,8 @@ class Handler(BaseHTTPRequestHandler):
                 return app.finding_detail(int(q.get("id", "0")))
             except ValueError:
                 raise ApiError("Bad id.")
+        if path == "/api/audit":
+            return app.audit_info()
         if path == "/api/fs":
             return app.fs_list(q.get("path", ""), q.get("mode", "dir"))
         if path == "/api/signatures/status":
@@ -3089,6 +3258,7 @@ tr.empty-row td{padding:60px 12px;text-align:center;color:var(--mute);cursor:def
 .btabs button.btn{font-size:11px;padding:3px 9px}
 .engBar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;color:var(--mute);font-size:11.5px;padding:2px 0 10px}
 .engBar .btn{font-size:11px;padding:3px 10px}
+.engBar .sp{flex:1}
 #eng{overflow:auto}
 .engTbl{width:100%;border-collapse:collapse;font-size:12px}
 .engTbl th{text-align:left;color:var(--mute2);font-weight:600;font-size:10px;text-transform:uppercase;letter-spacing:.05em;padding:4px 12px 4px 0;border-bottom:1px solid var(--line)}
@@ -3099,6 +3269,21 @@ tr.empty-row td{padding:60px 12px;text-align:center;color:var(--mute);cursor:def
 .engBad{color:var(--danger);font-weight:600}
 .engNo{color:var(--mute2)}
 .engDir{font-family:var(--font-mono);font-size:10.5px;color:var(--mute2);white-space:normal;overflow-wrap:anywhere;max-width:46ch}
+#vuln{overflow:auto}
+.vulnTbl td{white-space:nowrap}
+.vulnTbl td.vsum{white-space:normal;overflow-wrap:anywhere;max-width:56ch;color:var(--mute)}
+.vulnCmp{font-weight:600;color:var(--text)}
+.vulnMono{font-family:var(--font-mono);color:var(--mute)}
+.vulnNone{color:var(--mute2)}
+.vkev{color:#f43f5e;font-weight:700}
+.vsev-critical{color:#f43f5e;font-weight:700}
+.vsev-high{color:#fb923c;font-weight:600}
+.vsev-medium{color:#fbbf24;font-weight:600}
+.vsev-low,.vsev-none,.vsev-unknown{color:var(--mute2)}
+.vsort{cursor:pointer;user-select:none}
+.vsort[data-active="1"]{color:var(--acc)}
+.vnote{color:var(--mute2);font-size:11px;padding-top:8px;white-space:normal;overflow-wrap:anywhere}
+.vfilter{display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--text)}
 #foldBtn{color:var(--mute);background:var(--btn);border:1px solid var(--btn-border);border-radius:4px;padding:4px;display:inline-flex;align-items:center;justify-content:center}
 .bottom.collapsed #foldBtn svg{transform:rotate(180deg)}
 #foldBtn svg{width:14px;height:14px;transition:transform .2s}
@@ -3173,6 +3358,7 @@ fieldset.card.card-blue legend{color:#3b82f6}
 fieldset.card.card-amber legend{color:#f59e0b}
 fieldset.card.card-indigo legend{color:#6366f1}
 fieldset.card.card-emerald legend{color:#10b981}
+fieldset.card.card-cyan legend{color:#06b6d4}
 .grid{display:grid;grid-template-columns:1fr auto;gap:12px 8px;align-items:center}
 .grid label{grid-column:1/-1;font-size:12px;font-weight:500;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:-8px}
 .grid input[type=text]{grid-column:1;min-width:0;font-family:var(--font-mono);font-size:12px;padding:6px 12px;border-radius:6px}
@@ -3265,6 +3451,10 @@ fieldset.card.card-emerald legend{color:#10b981}
           <div class="opts" id="aiGrid"></div>
           <div class="hint">The AI reviews the suspicious files from the current report and stores the verdicts in the CSV (columns “AI Verdict” / “AI Comment”). The scanner's own Verdict column is never overwritten. Only localhost endpoints are allowed, and the endpoint is validated before any request is sent. File contents and snippets are sent to that endpoint.</div>
         </fieldset>
+        <fieldset class="card card-cyan"><legend>5. CMS audit</legend>
+          <div class="flags" id="auditRow"></div>
+          <div class="hint">Inventory, WordPress integrity and known vulnerabilities: what is installed, as opposed to what is inside a file. Only “Allow requests” makes the audit talk to anybody, and then it sends the WordPress version and the plugin/theme names it finds to api.wordpress.org and api.wpvulnerability.com — no site name, no paths, no file contents; answers are cached for a day in the data folder. Vulnerability verdicts are shown on the Vulnerabilities panel and in the report: they are never files to quarantine or delete, the fix is to update the component.</div>
+        </fieldset>
       </div>
       <div class="setNote">Settings are saved automatically and applied on the next launch.</div>
     </div>
@@ -3345,6 +3535,7 @@ fieldset.card.card-emerald legend{color:#10b981}
           <button class="btab" data-p="det" aria-selected="true">Details</button>
           <button class="btab" data-p="log" aria-selected="false">Log</button>
           <button class="btab" data-p="eng" aria-selected="false">Engines</button>
+          <button class="btab" data-p="vuln" aria-selected="false">Vulnerabilities</button>
           <span class="sp"></span>
           <span class="detQuickPath" id="detQuickPath"></span>
           <button id="logClear" class="btn" hidden>Clear view</button>
@@ -3354,6 +3545,7 @@ fieldset.card.card-emerald legend{color:#10b981}
         <div class="pane" id="det"><span class="empty">Select a row to see details.</span></div>
         <pre class="pane log" id="log" hidden></pre>
         <div class="pane" id="eng" hidden></div>
+        <div class="pane" id="vuln" hidden><span class="empty">The CMS audit did not run. Tick it on the Settings tab (section 5) and start a scan.</span></div>
       </div>
     </div>
   </section>
@@ -3369,7 +3561,8 @@ const $ = (id) => document.getElementById(id);
 const ESC = {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'};
 const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ESC[c]);
 const S = {settings: {}, tab: 'run', logNext: 0, ver: -1, noticeSeq: null, boot: null, sel: new Set(), order: [], last: null,
-           sort: 'score', desc: true, level: 'ALL', job: null, rows: [], saveTimer: null, online: false, fTimer: null, pvTimer: null, aiStats: null};
+           sort: 'score', desc: true, level: 'ALL', job: null, rows: [], saveTimer: null, online: false, fTimer: null, pvTimer: null, aiStats: null,
+           audit: null, auditVer: -1, vulnSort: 'severity', vulnDesc: true, vulnKev: false};
 
 async function api(path, body, opts) {
   const opt = {headers: {'X-Requested-With': 'scan-backdoors-gui'}};
@@ -3441,6 +3634,10 @@ const FLAGS = [['only_critical', 'Critical only'], ['no_warnings', 'No warnings'
 const CLEAN = [['clean_permanent', 'Delete permanently (no quarantine)'], ['clean_fm', 'Include web file managers (elp.php etc.)'],
   ['clean_core', 'Replace modified core files with originals (needs a clean Joomla of the same version)']];
 const AI_FLAGS = [['ai_enabled', 'Enable AI review (after the scan)']];
+const AUDIT_FLAGS = [['audit_inventory', 'Inventory of the installed components'],
+                     ['audit_integrity', 'WordPress core integrity (official checksums)'],
+                     ['audit_cve', 'Known vulnerabilities of the components'],
+                     ['audit_online', 'Allow the two audit services to be asked (names and versions leave this machine)']];
 const AI_TEXT = [['ai_base_url', 'Endpoint (e.g. http://127.0.0.1:8080/v1)'],
   ['ai_model', 'Model (optional - the gateway-loaded model is used when empty)']];
 
@@ -3468,6 +3665,7 @@ function buildSettings() {
     const l = document.createElement('label'); const c = document.createElement('input'); c.type = 'checkbox'; c.id = 'set_' + k; c.dataset.key = k;
     l.append(c, document.createTextNode(label)); box.appendChild(l); }); };
   flag($('flagRow'), FLAGS); flag($('cleanRow'), CLEAN); flag($('aiFlagRow'), AI_FLAGS);
+  flag($('auditRow'), AUDIT_FLAGS);
   const aog = $('aiGrid'); aog.innerHTML = '';
   AI_TEXT.forEach(([k, label]) => {
     const l = document.createElement('label'); l.textContent = label;
@@ -3875,6 +4073,15 @@ function signaturesCard(sg) {
     state = 'Active package: <b>' + esc(sg.active || '?') + '</b> \u00b7 rules: ' + (sg.rules == null ? '?' : sg.rules)
       + (sg.updated ? ' \u00b7 updated ' + esc(String(sg.updated).replace('T', ' ').replace('Z', '')) : '')
       + ' ' + (sg.verified ? '<span class="engYes">\u2713 verified</span>' : '<span class="engBad">\u26a0 not verified</span>');
+    if (sg.signature === 'verified') {
+      state += '<br><span class="engYes">\u2713 signed</span> by minisign key <b>'
+        + esc(String(sg.key_id || '?')) + '</b>'
+        + (sg.verification ? ' (' + esc(sg.verification) + ')' : '');
+    } else if (sg.signature === 'not-checked') {
+      state += '<br><span class="engBad">\u26a0 the pinned minisign signature was NOT checked'
+        + (sg.signature_library === false ? ' - the optional "cryptography" package is not installed' : '')
+        + ': this package rests on its pinned sha256 only</span>';
+    }
   }
   let failed = '';
   if (sg.failed && sg.failed.length) {
@@ -3931,6 +4138,12 @@ async function poll() {
     $('status').textContent = st.status;
     $('engines').textContent = (st.engines || []).map((e) => e.name + ' ' + e.version).join('  \u00b7  ');
     paintEngines(st);
+    paintAuditTab(st.audit);
+    const av = st.audit ? st.audit.version : -1;
+    if (av !== S.auditVer) {                   // a new scan (or a cleared one): the panel must refetch
+      S.auditVer = av; S.audit = null;
+      if (!$('vuln').hidden) showVulns();
+    }
     if (S.autoScanBaseline && !st.job && (st.status || '').indexOf('Baseline ready') === 0 && st.status !== S.lastStatus) {
       S.autoScanBaseline = false;               // the fetch may be over before a poll ever saw the job: key off the status
       await saveFromServer();
@@ -3982,14 +4195,143 @@ function showTab(t) {
   document.querySelectorAll('.tab').forEach((el) => el.classList.toggle('active', el.id === 'tab-' + t));
   document.querySelectorAll('.toptab').forEach((b) => b.setAttribute('aria-selected', b.dataset.tab === t ? 'true' : 'false'));
 }
+// ────────────────────────────────────────────── CMS audit: the vulnerabilities panel
+// A verdict is not a row of the findings table: no checkbox, no Quarantine, no
+// Delete, no Mass cleanup. The panel exists so that an outdated component is
+// visible without anybody being tempted to "clean" it out of the site.
+const VCOLS = [['component', 'Component'], ['component_version', 'Version'], ['cve', 'CVE'],
+               ['cvss', 'CVSS'], ['severity', 'Severity'], ['kev', 'KEV'], ['fixed_in', 'Fixed in'],
+               ['confidence', 'Confidence'], ['source', 'Source']];
+const VSEV = {critical: 0, high: 1, medium: 2, low: 3, none: 4, unknown: 5};
+
+function vsev(severity) {
+  const s = String(severity || 'unknown').toLowerCase();
+  return VSEV[s] === undefined ? 'unknown' : s;
+}
+function vkey(row, col) {
+  if (col === 'cvss') return (row.cvss === null || row.cvss === undefined) ? -1 : Number(row.cvss);
+  if (col === 'kev') return row.kev ? 1 : 0;
+  if (col === 'severity') return VSEV[vsev(row.severity)];
+  return String(row[col] || '').toLowerCase();
+}
+function sortedVulns(a) {
+  let rows = a.vulnerabilities.slice();
+  if (S.vulnKev) rows = rows.filter((r) => r.kev);
+  const col = S.vulnSort, sign = S.vulnDesc ? -1 : 1;
+  rows.sort((x, y) => {
+    const kx = vkey(x, col), ky = vkey(y, col);
+    const primary = kx < ky ? -1 : (kx > ky ? 1 : 0);
+    if (primary) return primary * sign;
+    return (vkey(x, 'severity') - vkey(y, 'severity')) || (vkey(x, 'cvss') - vkey(y, 'cvss'))
+      || String(x.component || '').localeCompare(String(y.component || ''));
+  });
+  return rows;
+}
+async function fetchAudit() {
+  if (S.audit) return S.audit;
+  try {
+    S.audit = await api('/api/audit');
+  } catch (e) {
+    S.audit = null;            // never show rows that the server did not answer with
+  }
+  return S.audit;
+}
+async function showVulns() {
+  await fetchAudit();
+  paintVulns();
+}
+function paintAuditTab(badge) {
+  const tab = document.querySelector('[data-p="vuln"]');
+  if (!tab) return;
+  const b = badge || {};
+  tab.textContent = 'Vulnerabilities' + (b.vulnerabilities ? ' (' + b.vulnerabilities + ')' : '');
+  tab.title = b.available
+    ? b.vulnerabilities + ' known-vulnerability verdict(s), ' + (b.kev || 0) + ' already exploited in the wild'
+    : 'The CMS audit has not run yet';
+}
+function auditHead(a) {
+  const inv = a.inventory || {}, integ = a.integrity || {};
+  const name = {wordpress: 'WordPress', joomla: 'Joomla'}[inv.cms] || (inv.cms || 'no supported CMS');
+  const parts = ['<b>' + esc(name) + (inv.cms_version ? ' ' + esc(inv.cms_version) : ' (version unknown)') + '</b>'];
+  const comps = inv.components || {};
+  const listed = Object.keys(comps).sort().map((k) => esc(k) + ' ' + comps[k]);
+  if (listed.length) parts.push('components: ' + listed.join(' \u00b7 '));
+  if (inv.unknown_versions) parts.push(inv.unknown_versions + ' without a declared version');
+  let html = '<div class="engBar"><span>' + parts.join('  \u00b7  ') + '</span>';
+  if (integ.checked) {
+    const bad = (integ.modified || 0) + (integ.extra || 0);
+    html += '<span class="' + (bad ? 'engBad' : 'engYes') + '">core integrity: ' + (integ.verified || 0)
+         + ' match ' + esc(integ.version || '?') + ', modified ' + (integ.modified || 0)
+         + ', extra ' + (integ.extra || 0) + ', missing ' + (integ.missing || 0) + '</span>';
+  }
+  html += '<span class="sp"></span><label class="vfilter"><input type="checkbox" id="vulnKev"'
+       + (S.vulnKev ? ' checked' : '') + '> only known exploited (KEV)</label></div>';
+  return html;
+}
+function paintVulns() {
+  const pane = $('vuln'), a = S.audit;
+  if (!a || !a.available) {
+    pane.innerHTML = '<span class="empty">' + ((a && a.enabled)
+      ? 'The CMS audit is on, but the last report holds no audit section (an older scanner build, or a scan that did not finish).'
+      : 'The CMS audit did not run. Tick it on the Settings tab (section 5) and start a scan.') + '</span>';
+    return;
+  }
+  let html = auditHead(a);
+  html += '<div class="engBar"><span class="engBad">Not file findings:</span><span>a verdict says the installed '
+        + 'version has a published CVE. Quarantine, Delete from disk and Mass cleanup never apply to it - '
+        + 'the fix is to update the component.</span></div>';
+  const rows = sortedVulns(a);
+  const unauditable = a.vulnerabilities.filter((r) => r.confidence === 'low').length;
+  if (unauditable) {
+    html += '<div class="engBar"><span class="engBad">\u26a0 ' + unauditable + ' component(s) could not be audited'
+          + ' (the version is not readable or the service did not answer). That is not proof of anything.</span></div>';
+  }
+  if (!rows.length) {
+    html += '<span class="empty">' + (a.vulnerabilities.length ? 'No verdict matches the filter.'
+      : 'No verdict: the local database (which ships empty) and the cache found nothing for these components. '
+        + 'Run the audit with requests allowed, or install a local database.') + '</span>';
+  } else {
+    const th = VCOLS.map((c) => '<th class="vsort" data-vcol="' + c[0] + '"' + (S.vulnSort === c[0] ? ' data-active="1"' : '')
+      + '>' + esc(c[1]) + (S.vulnSort === c[0] ? (S.vulnDesc ? ' \u2193' : ' \u2191') : '') + '</th>').join('');
+    html += '<table class="engTbl vulnTbl"><tr>' + th + '</tr>' + rows.map((r) => {
+      const sev = vsev(r.severity);
+      return '<tr>'
+        + '<td class="vulnCmp" title="' + esc(r.path || '') + '">' + esc(r.component || '?')
+        + ' <span class="vulnNone">' + esc(r.type || '') + '</span></td>'
+        + '<td class="vulnMono">' + esc(r.component_version || '?')
+        + (r.version_source && r.version_source !== 'declared' ? ' <span class="vulnNone">' + esc(r.version_source) + '</span>' : '') + '</td>'
+        + '<td class="vulnMono">' + esc(r.cve || '\u2014') + '</td>'
+        + '<td>' + ((r.cvss === null || r.cvss === undefined) ? '<span class="vulnNone">\u2014</span>' : esc(r.cvss)) + '</td>'
+        + '<td class="vsev-' + sev + '">' + esc(r.severity || 'unknown') + '</td>'
+        + '<td>' + (r.kev ? '<span class="vkev">\u26a0 yes</span>' : '<span class="vulnNone">no</span>') + '</td>'
+        + '<td class="vulnMono">' + esc(r.fixed_in || 'none published') + '</td>'
+        + '<td>' + esc(r.confidence || '') + '</td>'
+        + '<td class="vulnNone">' + esc(r.source || '') + '</td></tr>';
+    }).join('') + '</table>';
+  }
+  if (a.notes && a.notes.length) {
+    html += '<div class="vnote"><b>What the audit has to say about itself:</b><br>' + a.notes.map(esc).join('<br>') + '</div>';
+  }
+  pane.innerHTML = html;
+  const kev = $('vulnKev');
+  if (kev) kev.addEventListener('change', () => { S.vulnKev = kev.checked; paintVulns(); });
+  pane.querySelectorAll('[data-vcol]').forEach((t) => t.addEventListener('click', () => {
+    const col = t.dataset.vcol;
+    if (S.vulnSort === col) { S.vulnDesc = !S.vulnDesc; } else { S.vulnSort = col; S.vulnDesc = col !== 'component'; }
+    paintVulns();
+  }));
+}
+
 function showPanel(p) {
   document.querySelectorAll('[data-p]').forEach((x) => x.setAttribute('aria-selected', x.dataset.p === p ? 'true' : 'false'));
   $('det').hidden = p !== 'det';
   $('log').hidden = p !== 'log';
   $('eng').hidden = p !== 'eng';
+  $('vuln').hidden = p !== 'vuln';
   $('logCopy').hidden = p !== 'log';
   $('logClear').hidden = p !== 'log';
   $('bottom').classList.remove('collapsed');
+  if (p === 'vuln') showVulns();
 }
 function closeReports() { const m = $('repMenu'); m.classList.remove('open'); $('repBtn').setAttribute('aria-expanded', 'false'); }
 function showCtx(x, y) {

@@ -302,6 +302,32 @@ class SignaturesTest(unittest.TestCase):
         self.assertIn("failed", (state.get("status") or "").lower())
         self.assertFalse(st["present"], "a refused update must not change the active package")
 
+    @unittest.skipUnless(h.have_yara(), "installing a release runs the real compile check")
+    def test_the_card_reports_how_the_active_package_was_verified(self):
+        """Who signed the active rules is a security statement, so the GUI has to carry
+        updater's answer out of the data folder: the signature state, the key id, and
+        whether a signature could be checked at all on this machine."""
+        home = h.workdir("sbd-gui-")
+        self._install(home, "sbd-gui-sig-1")
+        doc_path = os.path.join(self._root(home), "signatures", "releases",
+                                "sbd-gui-sig-1", "RELEASE.json")
+        with open(doc_path, encoding="utf-8") as f:
+            doc = json.load(f)
+        doc.update({"verified": True, "verification": "minisign-ed25519",
+                    "signature": "verified", "signature_key_id": "0123456789abcdef"})
+        with open(doc_path, "w", encoding="utf-8") as f:
+            json.dump(doc, f)
+        gui = self._gui(home)
+        try:
+            st = gui.api("GET", "/api/signatures/status")
+        finally:
+            gui.stop()
+        self.assertEqual(st["signature"], "verified")
+        self.assertEqual(st["key_id"], "0123456789abcdef")
+        self.assertEqual(st["verification"], "minisign-ed25519")
+        self.assertIn(st["signature_library"], (True, False),
+                      "reported as a bool: whether cryptography is importable here")
+
 
 class PreflightTest(unittest.TestCase):
     """The check before a scan: the detected core version vs. the loaded clean baseline,
