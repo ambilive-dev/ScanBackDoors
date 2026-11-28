@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The bundle has one
 version for all three components; it is written once in `src/version.py` and a
 release is a tag with that number.
 
-## Unreleased
+## v3.3.1 — 2026-11-28
 
 - Browser GUI: the startup port fallback now walks a 100-port range (8765-8864 by default) instead of only 20 ports, so a port excluded by the operating system no longer makes the server die on startup. When every port in the range refuses to bind, the console says which reason was seen - EACCES (the port is excluded on Windows, or below 1024 elsewhere) with the `netsh int ipv4 show excludedportrange protocol=tcp` hint, or EADDRINUSE (the port is busy) with the actual bind errors - and exits with code 1. `--port` is validated up front (1-65535) and an invalid value exits with code 2.
 - Docs: README port section explains the fallback range, the excluded-range diagnosis and how to pick a `--port` outside it. Regression tests in `tests/test_gui_port.py` (fallback, busy-port NOTE, already-running detection, invalid `--port`, all-ports-busy failure path).

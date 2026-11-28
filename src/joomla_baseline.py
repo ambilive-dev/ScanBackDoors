@@ -36,7 +36,7 @@ import zipfile
 try:
     from version import VERSION
 except ImportError:
-    VERSION = "3.3"  # single-file fallback; must equal src/version.py
+    VERSION = "3.3.1"  # single-file fallback; must equal src/version.py
 
 RELEASE_URL_TEMPLATE = "https://api.github.com/repos/joomla/joomla-cms/releases/tags/%s"
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
