@@ -179,6 +179,128 @@ class BaselineFetchTest(unittest.TestCase):
         self.assertEqual(os.path.normpath(baseline_dir), os.path.normpath(expected))
 
 
+class SignaturesTest(unittest.TestCase):
+    """The signature endpoints: status from the manifest, update/rollback as a job.
+
+    The browser never sends a path or a URL, so the tests only check what the server
+    decides for itself: the private home (HOME/USERPROFILE are redirected by the
+    harness), the installed release, and the scanner command line the GUI builds.
+    """
+
+    RULE = ('rule GuiProbe {\n    strings:\n        $a = "SBD_GUI_SIG_PROBE_771" ascii wide\n'
+            "    condition:\n        $a\n}\n")
+
+    @staticmethod
+    def _root(home):
+        return os.path.join(home, ".scan_backdoors")
+
+    def _bundle(self, home, name):
+        import hashlib
+        import zipfile
+        bundle = os.path.join(home, name + ".zip")
+        entries = [{"path": "rules/a.yar",
+                    "sha256": hashlib.sha256(self.RULE.encode("utf-8")).hexdigest()}]
+        manifest = {"schema": 2, "package": {"name": name, "license": "CC0-1.0"}, "files": entries}
+        with zipfile.ZipFile(bundle, "w") as z:
+            z.writestr("rules/a.yar", self.RULE)
+            z.writestr("manifest.json", json.dumps(manifest))
+        return bundle
+
+    def _install(self, home, name):
+        bundle = self._bundle(home, name)
+        res = h.run("updater.py", ["--update-from-bundle", bundle, "--data-dir", self._root(home),
+                                   "--allow-unverified"])
+        self.assertEqual(res.returncode, 0, res.out)
+
+    def _wait_job(self, gui, timeout=90):
+        deadline = time.time() + timeout
+        while True:
+            state = gui.api("GET", "/api/state")
+            if state["job"] is None:
+                return state
+            if time.time() > deadline:
+                self.fail("the signatures job never finished: %r" % (state.get("status"),))
+            time.sleep(0.3)
+
+    def _gui(self, home):
+        """A started GUI whose data folder is pinned inside the private home (an
+        inherited SBD_DATA_DIR must never point a test at the developer's real one)."""
+        gui = h.Gui(home)
+        gui.env["SBD_DATA_DIR"] = self._root(home)
+        gui.start()
+        return gui
+
+    def test_status_reports_no_package_in_a_clean_home(self):
+        home = h.workdir("sbd-gui-")
+        gui = self._gui(home)
+        try:
+            st = gui.api("GET", "/api/signatures/status")
+        finally:
+            gui.stop()
+        self.assertFalse(st["present"])
+        self.assertIsNone(st["active"])
+        self.assertTrue(st["tool"], "updater.py ships next to the GUI")
+        self.assertEqual(os.path.normpath(st["data_dir"]),
+                         os.path.normpath(os.path.join(self._root(home), "signatures")),
+                         "the data folder must be inside the private home, never the real one")
+
+    @unittest.skipUnless(h.have_yara(), "installing a release runs the real compile check")
+    def test_an_installed_package_shows_up_and_rolls_back(self):
+        home = h.workdir("sbd-gui-")
+        self._install(home, "sbd-gui-sig-1")
+        self._install(home, "sbd-gui-sig-2")
+        gui = self._gui(home)
+        try:
+            st = gui.api("GET", "/api/signatures/status")
+            self.assertTrue(st["present"])
+            self.assertEqual(st["active"], "sbd-gui-sig-2")
+            self.assertEqual(st["rules"], 1)
+            self.assertEqual(sorted(st["releases"]), ["sbd-gui-sig-1", "sbd-gui-sig-2"])
+            gui.api("POST", "/api/signatures/rollback", {})
+            state = self._wait_job(gui)
+            self.assertIn("Signature rollback done", state.get("status") or "")
+            after = gui.api("GET", "/api/signatures/status")
+        finally:
+            gui.stop()
+        self.assertEqual(after["active"], "sbd-gui-sig-1")
+
+    @unittest.skipUnless(h.have_yara(), "installing a release runs the real compile check")
+    def test_a_scan_gets_the_installed_rules_and_the_state_the_status(self):
+        home = h.workdir("sbd-gui-")
+        site = fx.build("gui-sig-scan", planted=False)
+        self._install(home, "sbd-gui-sig-1")
+        gui = self._gui(home)
+        try:
+            gui.api("POST", "/api/settings", {"settings": {"site_dir": site, "workers": "1"}})
+            state = gui.api("GET", "/api/state")
+            self.assertTrue(state["signatures"]["present"])
+            gui.api("POST", "/api/scan/start", {"settings": {"site_dir": site, "workers": "1"}})
+            gui.wait_scan(timeout=180)
+            log = "\n".join(gui.api("GET", "/api/state?since=0")["log"]["lines"])
+        finally:
+            gui.stop()
+        rules = os.path.join(self._root(home), "signatures", "releases", "sbd-gui-sig-1", "rules")
+        log_fwd = log.replace("\\", "/")
+        self.assertIn("--yara-rules", log_fwd,
+                      "an installed package must be passed to the scanner (server-side path)")
+        self.assertIn(rules.replace("\\", "/"), log_fwd)
+        self.assertIn("YARA: 1 rule(s)", log_fwd, "the installed rule must actually load")
+
+    def test_update_without_a_configured_channel_fails_loudly(self):
+        # the job runs the real updater: with an empty sources.json template the project
+        # channel refuses, and the GUI must report it as a failure (never as success)
+        home = h.workdir("sbd-gui-")
+        gui = self._gui(home)
+        try:
+            gui.api("POST", "/api/signatures/update", {})
+            state = self._wait_job(gui)
+            st = gui.api("GET", "/api/signatures/status")
+        finally:
+            gui.stop()
+        self.assertIn("failed", (state.get("status") or "").lower())
+        self.assertFalse(st["present"], "a refused update must not change the active package")
+
+
 class PreflightTest(unittest.TestCase):
     """The check before a scan: the detected core version vs. the loaded clean baseline,
     and the engines list for the footer. Everything runs on synthetic folders."""

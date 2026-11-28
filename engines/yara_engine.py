@@ -29,6 +29,7 @@ from .base_engine import BaseEngine, SEV_CRIT, SEV_OBF, SEV_WARN, DEFAULT_WEIGHT
 
 MAX_RULE_FILES = 256
 MAX_RULE_FILE_SIZE = 8 * 1024 * 1024
+YARA_EXTS = (".yar", ".yara")              # rule file extensions the scanner and the checker accept
 
 # The rule may reference these; the scanner supplies values for every file.
 # extension is dotted and lower-case (extension == ".php"), path and folder
@@ -76,7 +77,7 @@ def collect_rule_files(source):
     """
     if os.path.isdir(source):
         out = [os.path.join(source, n) for n in sorted(os.listdir(source))
-               if n.lower().endswith((".yar", ".yara"))]
+               if n.lower().endswith(YARA_EXTS)]
         if not out:
             raise ValueError("no .yar/.yara rule files in folder: %s" % source)
     elif os.path.isfile(source):

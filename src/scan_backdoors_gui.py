@@ -981,9 +981,10 @@ class App(object):
             except ValueError:
                 raise ApiError("The field 'Modified after': use 14d or 2026-09-01.")
         try:
-            markers = "--progress-lines" in scanner.read_text(encoding="utf-8", errors="ignore")
+            scanner_text = scanner.read_text(encoding="utf-8", errors="ignore")
         except OSError:
-            markers = False
+            scanner_text = ""
+        markers = "--progress-lines" in scanner_text
         cmd = [python_exe(), "-u", str(scanner), str(site)]
 
         def add(flag, value):
@@ -1008,6 +1009,12 @@ class App(object):
             user_sigs_raw = ""
         if user_sigs_raw:
             cmd.extend(["--user-signatures", str(USER_SIGS_PATH)])
+        # the installed signature package (updater.py): the ACTIVE release's rules,
+        # a server-side path the browser can never influence; off when nothing is
+        # installed or the scanner build does not know the flag
+        yara_rules = self._active_rules_dir()
+        if yara_rules and "--yara-rules" in scanner_text:
+            cmd.extend(["--yara-rules", yara_rules])
         outputs = [("--xlsx", self.s("xlsx_path")), ("--json", self.s("json_path"))]
         if self.s("no_csv"):
             cmd.append("--no-csv")
@@ -1081,7 +1088,7 @@ class App(object):
                         "report_error": False}
             self.idle_text = ""
             self.log_add("\n" + "=" * 76 + "\nCommand: " + subprocess.list2cmdline(cmd) + "\n\n")
-            if not markers:
+            if not markers and kind == "scan":
                 self.log_add("WARNING: old scanner version (no --progress-lines), exact progress is unavailable. "
                              "Update scan_backdoors.py to %s or newer.\n\n" % MIN_SCANNER)
         threading.Thread(target=self._run_job, args=(cmd,), daemon=True).start()
@@ -1183,6 +1190,81 @@ class App(object):
                 self.job["baseline_folder"] = str(folder)
                 self.job["baseline_version"] = v
         return {"ok": True, "version": v, "folder": str(folder)}
+
+    # ------------------------------------------------------------- signatures
+    # The signature package is managed by src/updater.py. The browser never sends a
+    # URL or a path here: the sources are updater's own constants/config, the work
+    # runs as a background subprocess job, and the status is read from the manifest.
+    def _signatures_root(self):
+        d = os.environ.get("SBD_DATA_DIR") or os.path.join(os.path.expanduser("~"), ".scan_backdoors")
+        return os.path.abspath(os.path.expanduser(d))
+
+    def _active_rules_dir(self):
+        """The rules folder of the ACTIVE release, or None (validated exactly like
+        updater.Store.active() does)."""
+        name_s = ""
+        try:
+            with open(os.path.join(self._signatures_root(), "signatures", "ACTIVE"), encoding="utf-8") as f:
+                name_s = f.read().strip()
+        except OSError:
+            return None
+        if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$", name_s):
+            return None
+        d = os.path.join(self._signatures_root(), "signatures", "releases", name_s, "rules")
+        return d if os.path.isdir(d) else None
+
+    def signatures_status(self):
+        root = self._signatures_root()
+        sig_dir = os.path.join(root, "signatures")
+        manifest = None
+        try:
+            with open(os.path.join(sig_dir, "manifest.json"), encoding="utf-8") as f:
+                manifest = json.load(f)
+        except (OSError, ValueError):
+            manifest = None
+        active = self._active_rules_dir()
+        active_name = os.path.basename(os.path.dirname(active)) if active else None
+        pkg = (manifest or {}).get("package") or {}
+        rel_doc = None
+        if active:
+            try:
+                with open(os.path.join(os.path.dirname(active), "RELEASE.json"), encoding="utf-8") as f:
+                    rel_doc = json.load(f)
+            except (OSError, ValueError):
+                rel_doc = None
+        src = ((manifest or {}).get("sources") or {}).get((rel_doc or {}).get("source") or "", {})
+        verified = (rel_doc or {}).get("verified")
+        if verified is None:
+            verified = pkg.get("verified")
+        return {"present": bool(active), "active": active_name,
+                "rules": (rel_doc or {}).get("count") if rel_doc else (0 if not active else None),
+                "verified": verified,
+                "verification": (rel_doc or {}).get("verification") or pkg.get("verification"),
+                "updated": src.get("updated"), "manifest_generated": (manifest or {}).get("generated"),
+                "failed": (manifest or {}).get("failed") or [],
+                "releases": [r.get("name") for r in ((manifest or {}).get("releases") or [])],
+                "data_dir": sig_dir,
+                "tool": os.path.isfile(str(HERE / "updater.py"))}
+
+    def _updater_cmd(self, action_flags):
+        tool = str(HERE / "updater.py")
+        if not os.path.isfile(tool):
+            raise ApiError("updater.py was not found next to the scanner.")
+        return [python_exe(), "-u", tool] + action_flags + ["--data-dir", self._signatures_root()]
+
+    def signatures_update(self):
+        self._start_job("signatures", self._updater_cmd(["--update-signatures"]), markers=False)
+        with self.lock:
+            if self.job is not None:
+                self.job["text"] = "Updating the signature package…"
+        return {"ok": True}
+
+    def signatures_rollback(self):
+        self._start_job("signatures-rollback", self._updater_cmd(["--rollback-signatures"]), markers=False)
+        with self.lock:
+            if self.job is not None:
+                self.job["text"] = "Rolling the signatures back…"
+        return {"ok": True}
 
     # ---------------------------------------------------------------- engines
     ENGINE_SKIP_DIRS = {"files", "tmp", "cache", "logs", "media", "assets", "language", "languages",
@@ -1894,6 +1976,8 @@ class App(object):
                 self._finish_clean_plan(code, stopped)
             elif kind == "baseline":
                 self._finish_baseline(code, stopped, job)
+            elif kind in ("signatures", "signatures-rollback"):
+                self._finish_signatures(code, stopped, kind)
             else:
                 self._finish_clean_apply(code, stopped)
 
@@ -1984,6 +2068,24 @@ class App(object):
         self.status = msg
         self.log_add("\n" + msg + "\n")
 
+    def _finish_signatures(self, code, stopped, kind):
+        label = "Signature update" if kind == "signatures" else "Signature rollback"
+        if stopped:
+            self.status = "%s stopped by the user." % label
+            return
+        st = self.signatures_status()
+        if code == 0:
+            self.status = ("%s done: active package %s (%s rule(s), %s)." % (
+                label, st.get("active") or "?", st.get("rules") if st.get("rules") is not None else "?",
+                "verified" if st.get("verified") else "UNVERIFIED"))
+        elif code == 3:
+            self.status = "%s finished PARTIALLY - at least one source failed, see the log." % label
+            self.notify("warn", label, self.status)
+        else:
+            self.status = "%s failed (code %s) - the previously active package stays in place." % (label, code)
+            self.notify("error", label, self.status + " See the log for details.")
+        self.log_add("\n" + self.status + "\n")
+
     def _finish_clean_apply(self, code, stopped):
         summary = self.clean_summary or {}
         if stopped:
@@ -2048,7 +2150,8 @@ class App(object):
                     "idle_text": self.idle_text, "log": {"from": start, "lines": lines, "next": start + len(lines)},
                     "reports": self.reports_info(), "findings_version": self.findings_version,
                     "findings_total": len(self.findings), "notice": self.notice, "ai_stats": ai_stats,
-                    "engines": list(self.engines), "baseline": dict(self.baseline_view)}
+                    "engines": list(self.engines), "baseline": dict(self.baseline_view),
+                    "signatures": self.signatures_status()}
 
     # ------------------------------------------------------------ server-side file browser
     def fs_list(self, path, mode):
@@ -2236,6 +2339,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError("Bad id.")
         if path == "/api/fs":
             return app.fs_list(q.get("path", ""), q.get("mode", "dir"))
+        if path == "/api/signatures/status":
+            return app.signatures_status()
         raise ApiError("Not found", 404)
 
     def _route_post(self, app, path, body):
@@ -2268,6 +2373,10 @@ class Handler(BaseHTTPRequestHandler):
             return app.baseline_detect()
         if path == "/api/baseline/fetch":
             return app.baseline_fetch(str(body.get("version") or ""))
+        if path == "/api/signatures/update":
+            return app.signatures_update()
+        if path == "/api/signatures/rollback":
+            return app.signatures_rollback()
         if path == "/api/job/stop":
             app.stop_job()
             return {"ok": True}
@@ -3665,24 +3774,77 @@ async function aiSignaturesFlow() {
   } catch (e) { showErr(e); }
 }
 function paintEngines(st) {
-  const list = st.engines || [], base = st.baseline || {};
-  const sig = JSON.stringify([list, base]);
+  const list = st.engines || [], base = st.baseline || {}, sg = st.signatures || {};
+  const sig = JSON.stringify([list, base, sg, !!S.job]);
   if (sig === S.engSig) return; S.engSig = sig;
-  if (!list.length) { $('eng').innerHTML = '<span class="empty">No engines detected on the site. Choose the Site folder on the Settings tab.</span>'; return; }
-  let rows = '';
-  list.forEach((e) => {
-    let org;
-    if (e.name !== 'Joomla') org = '<span class="engNo" title="third-party originals are not downloaded by the app">not downloaded</span>';
-    else if (base.dir && base.match) org = '<span class="engYes">\u2713 loaded</span><div class="engDir">' + esc(base.dir) + '</div>';
-    else if (base.dir) org = '<span class="engBad">\u2717 folder holds ' + esc(base.version || 'an unrecognized Joomla version') + '</span><div class="engDir">' + esc(base.dir) + '</div>';
-    else org = '<span class="engNo">not downloaded</span>';
-    rows += '<tr><td class="engName">' + esc(e.name) + '</td><td class="engVer">' + esc(e.version) + '</td><td>' + org + '</td></tr>';
-  });
-  const bar = '<div class="engBar"><span>The originals below are downloaded freely from the publishers; the app can fetch the Joomla core.</span>'
-    + (base.joomla ? '<button class="btn" id="engFetch">Fetch Joomla ' + esc(base.joomla) + ' baseline</button>' : '') + '</div>';
-  $('eng').innerHTML = bar + '<table class="engTbl"><tr><th>Engine</th><th>Version</th><th>Original</th></tr>' + rows + '</table>';
+  let html;
+  if (!list.length) {
+    html = '<span class="empty">No engines detected on the site. Choose the Site folder on the Settings tab.</span>';
+  } else {
+    let rows = '';
+    list.forEach((e) => {
+      let org;
+      if (e.name !== 'Joomla') org = '<span class="engNo" title="third-party originals are not downloaded by the app">not downloaded</span>';
+      else if (base.dir && base.match) org = '<span class="engYes">\u2713 loaded</span><div class="engDir">' + esc(base.dir) + '</div>';
+      else if (base.dir) org = '<span class="engBad">\u2717 folder holds ' + esc(base.version || 'an unrecognized Joomla version') + '</span><div class="engDir">' + esc(base.dir) + '</div>';
+      else org = '<span class="engNo">not downloaded</span>';
+      rows += '<tr><td class="engName">' + esc(e.name) + '</td><td class="engVer">' + esc(e.version) + '</td><td>' + org + '</td></tr>';
+    });
+    const bar = '<div class="engBar"><span>The originals below are downloaded freely from the publishers; the app can fetch the Joomla core.</span>'
+      + (base.joomla ? '<button class="btn" id="engFetch">Fetch Joomla ' + esc(base.joomla) + ' baseline</button>' : '') + '</div>';
+    html = bar + '<table class="engTbl"><tr><th>Engine</th><th>Version</th><th>Original</th></tr>' + rows + '</table>';
+  }
+  html += signaturesCard(sg);
+  $('eng').innerHTML = html;
   const fb = $('engFetch');
   if (fb) fb.addEventListener('click', () => fetchBaseline(false));
+  const ub = $('sigUpdate');
+  if (ub) ub.addEventListener('click', updateSignatures);
+  const rb = $('sigRollback');
+  if (rb) rb.addEventListener('click', rollbackSignatures);
+}
+function signaturesCard(sg) {
+  if (!sg.tool) return '<div class="engBar" style="margin-top:16px"><b>Signature updates</b></div>'
+    + '<span class="empty">updater.py was not found next to the scanner: signature updates are unavailable.</span>';
+  let state;
+  if (!sg.present) state = '<span class="engNo">No rule package is installed.</span>';
+  else {
+    state = 'Active package: <b>' + esc(sg.active || '?') + '</b> \u00b7 rules: ' + (sg.rules == null ? '?' : sg.rules)
+      + (sg.updated ? ' \u00b7 updated ' + esc(String(sg.updated).replace('T', ' ').replace('Z', '')) : '')
+      + ' ' + (sg.verified ? '<span class="engYes">\u2713 verified</span>' : '<span class="engBad">\u26a0 not verified</span>');
+  }
+  let failed = '';
+  if (sg.failed && sg.failed.length) {
+    failed = '<div class="engBad">The last update failed for: ' + esc(sg.failed.map((f) => f.source).join(', ')) + '</div>';
+  }
+  const busy = !!S.job;
+  return '<div class="engBar" style="margin-top:16px"><b>Signature updates (YARA rules)</b>'
+    + '<span class="engDir">' + esc(sg.data_dir || '') + '</span></div>'
+    + '<div>' + state + '</div>' + failed
+    + '<div class="engBar"><button class="btn" id="sigUpdate"' + (busy ? ' disabled' : '') + '>Update signatures</button>'
+    + '<button class="btn" id="sigRollback"' + ((busy || (sg.releases || []).length < 2) ? ' disabled' : '')
+    + '>Roll back to the previous package</button></div>';
+}
+async function updateSignatures() {
+  const yes = await confirmDlg('Download the signature update?',
+    'The updater connects only to the hosts pinned in its own sources.json (https only). It downloads one archive, '
+    + 'checks its hashes, unpacks it safely and compiles every rule file BEFORE the new package becomes active. '
+    + 'If anything fails, the previously active package stays in place. Nothing is ever executed.',
+    'Download');
+  if (!yes) return;
+  try {
+    await api('/api/signatures/update', {});
+    toast('The signature update started - progress in the Log tab.', 'ok');
+  } catch (e) { showErr(e); }
+}
+async function rollbackSignatures() {
+  const yes = await confirmDlg('Roll the signatures back?',
+    'The previously installed rule package becomes the active one again. Nothing is deleted.', 'Roll back');
+  if (!yes) return;
+  try {
+    await api('/api/signatures/rollback', {});
+    toast('Rolling the signatures back - progress in the Log tab.', 'ok');
+  } catch (e) { showErr(e); }
 }
 async function startScan(noBaseline) {
   await api('/api/scan/start', noBaseline ? {settings: readSettings(), no_baseline: true} : {settings: readSettings()});

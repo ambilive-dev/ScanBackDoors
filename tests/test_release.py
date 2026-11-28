@@ -24,6 +24,7 @@ SCRIPTS = {
     "scan_backdoors_gui.py": "scan_backdoors_gui",
     "clean_malware.py": "clean_malware",
     "joomla_baseline.py": "joomla_baseline",
+    "updater.py": "updater",
 }
 ROOT_FILES = ["README.md", "LICENSE", "CHANGELOG.md", "SECURITY.md", "start.bat", ".gitignore"]
 INTERNAL_FLAGS = {"progress-lines", "release-url"}   # plumbing, not documented as a user option
@@ -110,7 +111,7 @@ class LayoutTest(unittest.TestCase):
     def test_shipped_scripts(self):
         found = sorted(f for f in os.listdir(h.SRC) if f.endswith(".py"))
         self.assertEqual(found, sorted(SCRIPTS) + ["version.py"],
-                         "src/ must contain exactly the scanner, the GUI, the cleaner and version.py")
+                         "src/ must contain exactly the shipped tools and version.py")
 
     def test_root_files_exist(self):
         for name in ROOT_FILES:

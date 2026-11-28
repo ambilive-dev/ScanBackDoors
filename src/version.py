@@ -2,9 +2,10 @@
 # -*- coding: utf-8 -*-
 """Version of the Scan Backdoors bundle - the only place where it is written.
 
-scan_backdoors.py (CLI scanner), scan_backdoors_gui.py (browser front end) and
-clean_malware.py (mass cleanup) all take VERSION from this file, so one release
-always reports one number: `--version` of any of the three prints the same value.
+scan_backdoors.py (CLI scanner), scan_backdoors_gui.py (browser front end),
+clean_malware.py (mass cleanup) and updater.py (signature updates) all take VERSION
+from this file, so one release always reports one number: `--version` of any of them
+prints the same value.
 
 Every script also keeps the same value as a one-line fallback, because the CLI
 scanner is routinely uploaded to a server as a single file and must still start

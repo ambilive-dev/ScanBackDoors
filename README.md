@@ -10,8 +10,9 @@ Only Python 3.6+ is required, nothing needs to be installed (no Tk, no pip). No 
 | `src/scan_backdoors.py` | 3.3.1 | The scanner: signatures, baseline diff against a clean Joomla, multi-processing, CSV/JSON/XLSX reports |
 | `src/scan_backdoors_gui.py` | 3.3.1 | Browser-based GUI: a local web server on 127.0.0.1 plus one page (scan, findings, quarantine, mass cleanup) |
 | `src/clean_malware.py` | 3.3.1 | Mass cleanup of known malware families, with quarantine and core-file restore from a clean distribution |
+| `src/updater.py` | 3.3.1 | Signature updates: safe install, activation and rollback of YARA rule packages (HTTPS, pinned hashes, nothing is ever executed) |
 
-The three components are one product and carry one version, written once in
+The components are one product and carry one version, written once in
 [`src/version.py`](src/version.py). `--version` on any of them prints the same number, so
 `scan_backdoors_gui.py --version` tells you which release you are actually running.
 
@@ -19,7 +20,8 @@ The three components are one product and carry one version, written once in
 
 ```
 start.bat                     Windows launcher (double-click)
-src/                          the three scripts + version.py; they must stay in one folder
+src/                          the scripts (scanner, GUI, cleaner, updater) + version.py; they must stay in one folder
+engines/                      optional detection engines (YARA) + yara_check.py, the rule-set compile checker
 assets/                       logo PNG and the .ico for a desktop shortcut
 data/                         known-clean hash allowlist (see below)
 docs/                         Russian manual (docs/README_RU.md)
@@ -38,7 +40,7 @@ In the GUI, set the same file as *Whitelist* on the **Settings** tab. Entries ar
 
 ## Launching
 
-The three scripts in `src/` must stay in the same folder: the GUI looks for `scan_backdoors.py` next to itself and uses `clean_malware.py` next to the scanner.
+The scripts in `src/` must stay in the same folder: the GUI looks for `scan_backdoors.py` next to itself, uses `clean_malware.py` next to the scanner, and `updater.py` next to itself for signature updates.
 
 | File | Purpose |
 |---|---|
@@ -46,6 +48,7 @@ The three scripts in `src/` must stay in the same folder: the GUI looks for `sca
 | `src/scan_backdoors_gui.py` | Browser-based GUI: a small local web server plus a page in your browser (scan, results table, quarantine/delete, mass cleanup) |
 | `src/scan_backdoors.py` | The scanner (command line) |
 | `src/clean_malware.py` | Mass cleanup (command line; also used by the GUI "Mass cleanup" button) |
+| `src/updater.py` | Signature updates for the optional YARA engine (see below) |
 
 Optional files: `assets/emblem_ScanBackDoors_512.png` (the logo; the GUI has a small copy of it built in, so it works without this file) and `assets/scan_backdoors.ico` (an icon for a desktop shortcut to `start.bat`: right-click the shortcut, *Properties*, *Change Icon…*, choose this file).
 
@@ -97,7 +100,7 @@ The page remembers the last state (log, results) while the server runs, so you c
 ### First run in the GUI
 
 1. **Settings** tab: choose the *Site folder* (optionally a *Clean Joomla* folder, a *Whitelist* and the report paths). No clean copy of the same version at hand? The *Fetch baseline* button next to the *Clean Joomla (optional)* field detects the site's Joomla version from its own files, asks you to confirm (`Download the clean Joomla x.y.z baseline?`), downloads the official Full_Package from the `joomla/joomla-cms` GitHub releases over HTTPS with progress in the Log tab, and fills the field in automatically. This is the only part of the app that reaches the internet, and only after that confirmation. The tab is a centered two-column grid of four cards — *1. Scan scope & targets* (paths), *2. Heuristic scoring & flags* (thresholds, exclusions, flags), *3. Mass cleanup* (mode, family, core-file restore) and *4. AI review (local model)* (endpoint, model, flags) — with a *Go to run →* button in the header. **Browse…** opens a file chooser that lists the folders of the machine where the server runs.
-2. **Run and results** tab: press *Start scan*. Before the scan starts the GUI checks that the loaded *Clean Joomla* folder matches the site's detected Joomla version; on a mismatch (or when no baseline is set) it offers to fetch the matching baseline first - the scan then resumes automatically when the download finishes - or to scan without originals with your consent (core files are then judged by heuristics only, and the Log says so). The footer shows what the site runs: the detected Joomla version plus third-party engines that publish their version (VirtueMart and similar extensions whose originals are freely downloadable). The Details/Log panel has a third tab, **Engines**, listing every detected engine with its version and an original-loaded mark for the Joomla core (✓ loaded, ✗ the Clean Joomla folder holds another version, or not downloaded, with the folder path) and a *Fetch baseline* shortcut. A baseline downloaded through the GUI makes the next scan faster: the scanner reuses the sha256 manifest `joomla_baseline.py` wrote at download time instead of re-hashing the baseline tree. The tab is built around the results table in a self-contained, dark-first theme (light mode available; both persisted per browser, `prefers-color-scheme` honoured, no external fonts or CDNs): a slim top bar with the embedded logo, the icon-bearing Settings / Run and results tabs, a connection badge, a round dark/light sun/moon pill and the *Quit server* button; below it a run row (Start/Stop, progress bar, status line with files done, elapsed, estimated remaining time and the file currently processed, *AI review* with a threats/errors counter next to it, a *Remove false positives* button, *Candidates* with a count of the signature groups it offers and a *Reports* menu); a two-row toolbar — live level chips (All / High / Medium / Low with colored per-level counts, computed by the backend from the query + AI-filtered base), a search box (press `/`), an AI verdict filter and a Reset button on the first row, the actions row (Show file / Quarantine / Delete from disk / Mass cleanup / Select all, each with a line icon) on the second; and, in its own scroll region with a sticky table header, a table that is almost the whole tab. On wide screens (at least 1100 px) the table takes two thirds of the tab and the Details/Log panel sits in the right column (one third, resizable by dragging the gutter) instead of underneath the table; the fold button is hidden there, because the panel no longer collapses vertically. On narrower screens the layout is the classic stacked one: table on top, panel below it. Click a column header to sort (Score sorts descending by default).
+2. **Run and results** tab: press *Start scan*. Before the scan starts the GUI checks that the loaded *Clean Joomla* folder matches the site's detected Joomla version; on a mismatch (or when no baseline is set) it offers to fetch the matching baseline first - the scan then resumes automatically when the download finishes - or to scan without originals with your consent (core files are then judged by heuristics only, and the Log says so). The footer shows what the site runs: the detected Joomla version plus third-party engines that publish their version (VirtueMart and similar extensions whose originals are freely downloadable). The Details/Log panel has a third tab, **Engines**, listing every detected engine with its version and an original-loaded mark for the Joomla core (✓ loaded, ✗ the Clean Joomla folder holds another version, or not downloaded, with the folder path) and a *Fetch baseline* shortcut; the same tab shows the installed YARA signature package (active release, rule count, verified/not verified, update date) with *Update signatures* and *Roll back to the previous package* buttons - both run `updater.py` as a background job after a confirmation, and a scan then uses the installed rules automatically. A baseline downloaded through the GUI makes the next scan faster: the scanner reuses the sha256 manifest `joomla_baseline.py` wrote at download time instead of re-hashing the baseline tree. The tab is built around the results table in a self-contained, dark-first theme (light mode available; both persisted per browser, `prefers-color-scheme` honoured, no external fonts or CDNs): a slim top bar with the embedded logo, the icon-bearing Settings / Run and results tabs, a connection badge, a round dark/light sun/moon pill and the *Quit server* button; below it a run row (Start/Stop, progress bar, status line with files done, elapsed, estimated remaining time and the file currently processed, *AI review* with a threats/errors counter next to it, a *Remove false positives* button, *Candidates* with a count of the signature groups it offers and a *Reports* menu); a two-row toolbar — live level chips (All / High / Medium / Low with colored per-level counts, computed by the backend from the query + AI-filtered base), a search box (press `/`), an AI verdict filter and a Reset button on the first row, the actions row (Show file / Quarantine / Delete from disk / Mass cleanup / Select all, each with a line icon) on the second; and, in its own scroll region with a sticky table header, a table that is almost the whole tab. On wide screens (at least 1100 px) the table takes two thirds of the tab and the Details/Log panel sits in the right column (one third, resizable by dragging the gutter) instead of underneath the table; the fold button is hidden there, because the panel no longer collapses vertically. On narrower screens the layout is the classic stacked one: table on top, panel below it. Click a column header to sort (Score sorts descending by default).
 3. Select rows (click, Ctrl/Shift+click, Ctrl+A, or the leading checkboxes — the header checkbox selects or clears all visible rows) and the Details/Log panel — below the table on narrow screens, in the right column on wide screens — shows the selected finding: the full file path with a Copy button, the SHA-256 digest and the signature rule as cards, an AI heuristic verdict box with the badge and the comment, and the source snippet in a scrollable panel (the AI column in the table itself is colored text — ⚠ threat / ✓ false positive — and the verdict box is tinted to match; the level column uses solid rose/amber/slate badges). Switch between the **Details** and **Log** tabs; drag the gutter to resize the panel, double-click the gutter or the fold button to collapse it. Use *Show file*, *Quarantine*, *Delete from disk* (or the Delete key) or the right-click menu (copy path, copy SHA-256, add to whitelist). *Mass cleanup* handles the known malware families across the whole site: it first shows a plan and asks for confirmation. The level chips and the search/AI filters combine — the chip counts stay live and reflect the current query and AI filter.
 4. Open the reports (CSV/XLSX/JSON) with the *Reports* menu (*Open reports folder* for the folder, then *Open CSV/XLSX/JSON* to open a report, or the *Download CSV/XLSX/JSON* anchors to save one through the browser).
 
@@ -284,6 +287,8 @@ The scanner can additionally run [YARA](https://github.com/VirusTotal/yara) rule
 python3 scan_backdoors.py /home/user/site --yara-rules /path/to/rules/
 ```
 
+An installed signature package is the ready-made argument: `--yara-rules "$(python3 src/updater.py --rules-path)"` (see [Signature updates](#signature-updates-updaterpy)); the GUI passes it automatically when a release is installed.
+
 Scan-gap semantics matter: yara-python silently returns incomplete matches when a rule hits its timeout, so the scanner double-checks the elapsed time itself and flags any file that ran up to the limit. Statistics show `YARA: rules loaded / files scanned / scan gaps`.
 
 ### Performance and output
@@ -444,6 +449,55 @@ joomla-baselines/Joomla_3.9.27.baseline.json   <- manifest: every file and its s
 | `--keep-archive` | keep the downloaded zip |
 
 The scanner uses the manifest directly: with `--baseline-dir` pointing at a downloaded folder it reuses the recorded hashes instead of re-hashing thousands of files (files missing from the manifest are hashed on the spot, so a hand-edited baseline can never make a modified core file look clean). A re-run verifies the cached baseline offline (no network) and re-downloads only if a file changed. The resulting folder is accepted by both `scan_backdoors.py --baseline-dir` and `clean_malware.py --replace-core --baseline-dir`. The tool talks to `api.github.com` and GitHub's download CDN over HTTPS only: a download URL taken from the release API must point at those hosts, a truncated download (fewer bytes than `Content-Length`) and a corrupted archive are reported as a clear error, never left behind as a partial baseline.
+
+---
+
+## Signature updates (`updater.py`)
+
+`updater.py` installs YARA rule packages for the optional [YARA engine](#yara-rules-optional-extra-engine), so the rule set can grow between releases of the tool. It is deliberately conservative: a rule set becomes active only as a whole (`atomic` — the last step is switching a pointer), only after it has passed integrity and compile checks, and the previous release always stays on disk for a rollback. Nothing that is downloaded is ever executed — rule files are only compiled by `yara-python` in a checked subprocess.
+
+```
+python3 updater.py --update-signatures              # the project's own package (URL pinned in sources.json)
+python3 updater.py --update-from-bundle sigs.zip    # offline: a package you obtained yourself
+python3 updater.py --update-from-upstream           # sync upstreams pinned by commit SHA in sources.json
+python3 updater.py --status                         # what is active right now (JSON)
+python3 updater.py --rules-path                     # print the folder to pass to --yara-rules
+python3 updater.py --rollback-signatures            # make the previous release active again
+```
+
+| flag | meaning |
+|---|---|
+| `--update-signatures` | install the project's own rule package: the URL and the archive sha256 are pinned in `sources.json`, HTTPS and a host allowlist are enforced |
+| `--update-from-bundle FILE` | install a package from a local zip (the offline path; every check still runs) |
+| `--update-from-upstream` | re-download the upstream rule sources pinned in `sources.json`; only sources pinned to a full 40-hex commit SHA **and** a pinned archive sha256 are synced — a branch reference is refused before any request. A source that fails keeps the rules it contributed to the previous release (a falling source never erases what works), and the run exits 3 (PARTIAL) |
+| `--rollback-signatures` | activate the previous release again |
+| `--status` | print the active release, its rule count, verification and any failed sources as JSON |
+| `--rules-path` | print the `rules` folder of the active release (exit 1 when nothing is installed) — what you pass to `scan_backdoors.py --yara-rules` |
+| `--package-sha256 HEX` | out-of-band sha256 of the archive; with it the update is **verified**, without it the updater refuses |
+| `--allow-unverified` | accept a package nothing can verify — loudly, and the manifest records `"verified": false` |
+| `--only SOURCE` | with `--update-from-upstream`: sync only this source (the others are carried over) |
+| `--data-dir DIR` | data folder (default: `%SBD_DATA_DIR%`, otherwise `~/.scan_backdoors`) |
+| `--version` | print the bundle version |
+
+**What one update does**: download (streamed, size-capped) → check the pinned sha256 → unpack safely (only `.yar`/`.yara`/license files, zip-slip / symlink / compression-bomb guards, nothing outside the staging folder) → compile every rule file in a separate subprocess with its own timeout (`engines/yara_check.py`) → move the staged release into place atomically → switch the `ACTIVE` pointer → rewrite the manifest. Any failure at any step leaves the previous release active; a source that fails during `--update-from-upstream` keeps its rules.
+
+**Trust model**: an update is only trusted when its archive sha256 is pinned (in `sources.json` or given with `--package-sha256`). A project package (and any `--update-from-bundle` file) must carry its own `manifest.json` declaring every rule file with its sha256 — an undeclared rule file makes the whole package refused. An upstream commit zip has no manifest of its own: there the pinned archive sha256 is the whole trust, which is why pinning is mandatory. Signature verification (`minisign`/`cosign`) is planned and not implemented; until then "verified" means "matches a pinned hash", and `--allow-unverified` exists as an explicit, logged escape hatch.
+
+**Where things live** (under `--data-dir`, created on first run):
+
+```
+signatures/ACTIVE                  the name of the active release (one line)
+signatures/manifest.json           what is active, what is installed, what failed
+signatures/sources.json            the pinned channels (edit this one by hand)
+signatures/releases/<name>/rules/  the rule files of each release
+logs/updater.log                   rotating log (secrets and tokens are masked)
+```
+
+`sources.json` is created as a template: `package_source` (the project's own package: `url` + `sha256`) and `upstream` (a list of `{name, repo, commit, archive_sha256, license}`). Pinned hashes and third-party rule licences must be reviewed by a human before anything is put there — see `docs/OPEN_QUESTIONS.md`. Upstream rules are third-party content: review their licence before pinning them, the updater records `license` but does not judge it.
+
+**Using the installed rules**: `python3 src/scan_backdoors.py /path/to/site --yara-rules "$(python3 src/updater.py --rules-path)"`. The GUI does this automatically: when a release is installed, scans pass its rules folder to the scanner (a path the browser page can never influence), and the **Engines** tab shows the active package with *Update signatures* and *Roll back* buttons.
+
+**Compile check needs `yara-python`** (`pip install yara-python`): without it the updater refuses to activate a package it cannot compile-check. Exit codes: `0` everything updated, `1` usage/config error, `3` PARTIAL (at least one upstream source failed — see the manifest), `4` verification or network failure (the previous release is unchanged).
 
 ---
 

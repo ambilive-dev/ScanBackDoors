@@ -9,6 +9,16 @@ point it at and writes only the reports you ask for.
 
 - No network access of any kind from the scanner or the cleaner. Nothing is
   uploaded, no telemetry, no update checks. The GUI listens on `127.0.0.1` only.
+- The only outbound requests in the bundle are the two you explicitly start: the
+  clean-baseline downloader (`joomla_baseline.py`, also the GUI's *Fetch baseline*
+  button) and the signature updater (`updater.py`, also its GUI buttons). Both speak
+  HTTPS only to a fixed host allowlist and re-check every redirect against it; both
+  stream into size-capped files and verify hashes. The updater never executes what it
+  downloads: a rule package is unpacked under path/symlink/size guards, every rule
+  file is compile-checked in a separate process, and only then does an atomic pointer
+  switch make it active - a failed update leaves the previous release in place, and
+  an unverified package is refused unless you pass `--allow-unverified` (which is
+  recorded in the manifest). Nothing is uploaded by any of them.
 - Nothing is deleted without an explicit action: quarantine by default, copies of
   modified files are kept, `clean_malware.py` needs `--apply` to change anything
   and can be rolled back with `--restore manifest.json`.

@@ -56,6 +56,16 @@ def tool_path(script):
     return os.path.join(SRC, script)
 
 
+def have_yara():
+    """True when the optional yara-python is importable. It is never imported here:
+    tests that install or run rule sets are skipped without it."""
+    import importlib.util
+    try:
+        return importlib.util.find_spec("yara") is not None
+    except (ImportError, ValueError):
+        return False
+
+
 def run(script, args, cwd=None, timeout=600, env=None):
     """Run src/<script> with args -> CompletedProcess-like (returncode, out, err)."""
     proc = subprocess.Popen(

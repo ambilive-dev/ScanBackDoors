@@ -1,10 +1,42 @@
 # Changelog
 
 All notable changes to this project are documented here. The bundle has one
-version for all three components; it is written once in `src/version.py` and a
+version for all components; it is written once in `src/version.py` and a
 release is a tag with that number.
 
 ## Unreleased
+- Signature updates (TZ v2 Sprint 2): a new shipped tool, `src/updater.py`, installs
+  YARA rule packages for the optional engine and nothing else. Trust model: a rule set
+  becomes active only as a whole and only after checks - download (HTTPS only, host
+  allowlist, every redirect re-checked, streamed with a hard size cap) → the pinned
+  archive sha256 → safe unpacking (only `.yar`/`.yara`/license files, no `extractall`,
+  zip-slip / absolute-path / symlink / compression-bomb guards, nothing written outside
+  the staging folder, which lives on the same filesystem as the target) → every rule
+  file compiled in a separate `engines/yara_check.py` subprocess with its own timeout →
+  the release directory moved into place with one `os.replace` → the `ACTIVE` pointer
+  switched and the manifest rewritten atomically (tmp + fsync + `os.replace`). Nothing
+  that is downloaded is executed. Channels: `--update-signatures` (the project's own
+  package, URL+sha256 pinned in `sources.json`), `--update-from-bundle FILE` (offline,
+  same checks, the package manifest must declare every rule file), `--update-from-upstream`
+  (only sources pinned to a full 40-hex commit SHA **and** a pinned archive sha256 - a
+  branch is refused before any request; one merged release from all sources, a failing
+  source carries over the rules it contributed instead of erasing them, exit `3`
+  PARTIAL), `--rollback-signatures`, `--status`, `--rules-path`. A package nothing can
+  verify is refused unless `--allow-unverified` is passed, and is then recorded
+  `"verified": false`; signature schemes (minisign/cosign) are not implemented yet.
+  Data lives in `$SBD_DATA_DIR` (or `~/.scan_backdoors`): `signatures/{releases,ACTIVE,
+  manifest.json,sources.json}` plus a rotating `logs/updater.log` with secrets masked
+  and external strings sanitized (no log injection). Exit codes: `0` / `1` config /
+  `3` partial / `4` verification-or-network failure (the previous release stays
+  active). GUI: `GET /api/signatures/status`, `POST /api/signatures/update`,
+  `POST /api/signatures/rollback` (no client-supplied paths or URLs - the sources are
+  updater's own config; the work runs as a background job like the baseline fetch), the
+  Engines tab shows the active package with *Update signatures* / *Roll back*, and a
+  scan automatically receives `--yara-rules` for the active release when the installed
+  scanner understands the flag. Tests: `tests/test_updater.py` (URL policy, strict
+  redirects, log masking/sanitization, safe unpacking attacks, download limits, the CLI
+  contract, upstream sync against a fake downloader - no test opens a socket) and
+  `SignaturesTest` in `tests/test_gui.py`; `tests/harness.py` gained `have_yara()`.
 - Scanner (TZ v2 Sprint 1): an optional YARA rules engine behind a new first-party
   `engines/` package (`base_engine.py`: ScanCtx + BaseEngine returning
   `(hits, gap_reasons)`; `yara_engine.py`: optional yara-python, imported lazily).
