@@ -27,10 +27,27 @@ def sources():
     return [os.path.join(h.SRC, f) for f in sorted(os.listdir(h.SRC)) if f.endswith(".py")]
 
 
+def engine_sources():
+    eng = os.path.join(h.REPO, "engines")
+    return [os.path.join(eng, f) for f in sorted(os.listdir(eng)) if f.endswith(".py")]
+
+
+FIRST_PARTY = {"version", "engines"}     # modules that live in this repository
+
+
+def imported_names(tree):
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for mod in [a.name.split(".")[0] for a in node.names]:
+                yield node, mod
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            yield node, node.module.split(".")[0]
+
+
 class SyntaxFloorTest(unittest.TestCase):
     @unittest.skipIf(sys.version_info < (3, 8), "ast.parse(feature_version=) needs Python 3.8+")
     def test_sources_parse_as_python_36(self):
-        for path in sources():
+        for path in sources() + engine_sources():
             with self.subTest(script=os.path.basename(path)):
                 try:
                     ast.parse(read(path), filename=path, feature_version=OLDEST)
@@ -60,11 +77,40 @@ class SyntaxFloorTest(unittest.TestCase):
                 elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
                     names = [node.module.split(".")[0]]
                 for name in names:
-                    if name in allowed_third or name == "version":
+                    if name in allowed_third or name in FIRST_PARTY:
                         continue
                     if stdlib and name not in stdlib:
                         self.fail("%s imports %r: the tools must run on a stdlib-only Python"
                                   % (os.path.basename(path), name))
+
+    def test_engines_may_only_import_third_party_lazily(self):
+        """engines/ is first-party and follows the same rules; the single
+        exception is a THIRD-PARTY module imported inside a function body
+        (the optional yara-python): a module-level import would break the
+        stdlib-only promise for every user who did not install it."""
+        stdlib = set(getattr(sys, "stdlib_module_names", ()))
+        for path in engine_sources():
+            tree = ast.parse(read(path), filename=path)
+            for node, mod in imported_names(tree):
+                if mod in FIRST_PARTY or (stdlib and mod in stdlib):
+                    continue
+                if mod == "yara":         # the one optional dependency (requirements-optional.txt)
+                    self.assertTrue(self._inside_function(tree, node),
+                                    "%s imports %r at module level: an optional engine "
+                                    "dependency must be imported lazily inside a function"
+                                    % (os.path.basename(path), mod))
+                    continue
+                self.fail("%s imports %r: the tools must run on a stdlib-only Python"
+                          % (os.path.basename(path), mod))
+
+    @staticmethod
+    def _inside_function(tree, target):
+        for fn in ast.walk(tree):
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for sub in ast.walk(fn):
+                    if sub is target:
+                        return True
+        return False
 
     def test_tests_parse_on_the_running_interpreter(self):
         for name in sorted(os.listdir(h.HERE)):

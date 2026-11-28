@@ -268,6 +268,24 @@ python3 scan_backdoors.py /home/user/site --user-signatures my-signatures.json
 * Entries are validated on load; the scanner never crashes on a broken pattern.
 * The GUI writes its confirmed proposals to `%USERPROFILE%\.scan_backdoors_user_signatures.json` (you can inspect the file; entries with the same label and pattern are replaced, not duplicated) and passes `--user-signatures` on the next scan when the file exists and is not empty.
 
+### YARA rules (optional extra engine)
+
+The scanner can additionally run [YARA](https://github.com/VirusTotal/yara) rule files as one more detection engine. This is fully optional: without `--yara-rules` nothing changes, and without the `yara-python` package installed the scanner prints that the YARA engine is OFF and scans with the built-in heuristics exactly as before (`pip install -r requirements-optional.txt` adds it).
+
+| Option | Default | Description |
+|---|---|---|
+| `--yara-rules PATH` | | A `.yar`/`.yara` file, or a folder of them (non-recursive). Every hit appears as a signature `YARA: <file>.<rule>`. A rule's `meta` may set `severity` (critical/high/medium/low/…) and `score` (1-50); a rule without meta is always a `[WARNING]`. Rules may use the bound externals `file_name`, `extension`, `path`, `folder`, `file_size`, `cms`, `wp_root`, `joomla_root`, `rule_language`. A rule file that fails to compile is reported and skipped - the rest keep working. `include` directives are refused: every rule file must stand on its own. |
+| `--no-yara` | | Never run the YARA engine, even with `--yara-rules` given. |
+| `--yara-cache DIR` | `%TEMP%/scan-backdoors-yarac` | Folder for the compiled `.yarac` cache (keyed by rule content; a corrupt cache file is rebuilt automatically). |
+| `--no-yara-cache` | | Do not read or write the `.yarac` cache; compile in every process. |
+| `--yara-timeout SEC` | `5` | Per-file time limit for the YARA scan. A file that hits the limit is reported as a scan gap (`[WARNING]` hit + a STATISTICS line), never as clean. |
+
+```bash
+python3 scan_backdoors.py /home/user/site --yara-rules /path/to/rules/
+```
+
+Scan-gap semantics matter: yara-python silently returns incomplete matches when a rule hits its timeout, so the scanner double-checks the elapsed time itself and flags any file that ran up to the limit. Statistics show `YARA: rules loaded / files scanned / scan gaps`.
+
 ### Performance and output
 
 | Option | Default | Description |

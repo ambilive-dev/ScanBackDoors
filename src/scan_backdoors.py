@@ -9,6 +9,7 @@ Examples:
     python3 scan_backdoors.py . --since 14d --only-critical
     python3 scan_backdoors.py . --baseline-dir /tmp/Joomla_clean --csv out.csv --json out.json --xlsx out.xlsx
     python3 scan_backdoors.py . --whitelist whitelist.txt --workers 4
+    python3 scan_backdoors.py . --yara-rules rules/      # optional extra engine (needs yara-python)
 
 Exit codes: 0 - no critical findings, 2 - there are [CRITICAL] findings, 1 - startup error.
 """
@@ -37,6 +38,19 @@ try:                                       # single source of truth: version.py 
     from version import VERSION
 except ImportError:                        # a single uploaded file still has to start
     VERSION = "3.3.1"                        # keep in sync with src/version.py (tests/test_release.py checks it)
+
+try:                                       # extra detection engines: engines/ lives in the repo root
+    from engines.base_engine import ScanCtx
+    from engines.yara_engine import build_yara_engine, collect_rule_files
+except ImportError:                        # run from another folder: put the repo root on the path
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    try:
+        from engines.base_engine import ScanCtx
+        from engines.yara_engine import build_yara_engine, collect_rule_files
+    except ImportError:                    # a single uploaded file has no engines/: YARA stays off
+        ScanCtx = None
+        build_yara_engine = None
+        collect_rule_files = None
 
 # --self-test: the same four samples the test suite plants (tests/payloads/*.b64),
 # sealed here so a single uploaded file can verify itself. They are unsealed only
@@ -324,6 +338,36 @@ CFG = {}
 def _init(cfg):
     global CFG
     CFG = cfg
+
+
+def yara_key(spec):
+    """Stable per-process cache key for one --yara-rules configuration."""
+    return (tuple(spec["sources"]), spec["cache"], float(spec["timeout"]),
+            tuple(sorted(spec["externals"].items())))
+
+
+_YARA_ENGINES = {}
+
+
+def get_engines(cfg):
+    """Extra detection engines for this process ([] when --yara-rules is off).
+
+    Rules compile once per worker process (lazily, on its first batch); the
+    .yarac cache under cfg["yara"]["cache"] makes that cheap. Compilation
+    problems were already reported by the main process, so workers build
+    quietly."""
+    spec = cfg.get("yara")
+    if not spec or build_yara_engine is None:
+        return []
+    key = yara_key(spec)
+    engines = _YARA_ENGINES.get(key)
+    if engines is None:
+        eng, _problems = build_yara_engine(spec["sources"], cache_dir=spec["cache"],
+                                           base_externals=spec["externals"],
+                                           timeout=spec["timeout"])
+        engines = [eng] if eng is not None else []
+        _YARA_ENGINES[key] = engines
+    return engines
 
 
 def looks_random(stem):
@@ -966,7 +1010,7 @@ def path_whitelisted(rel, patterns):
     return False
 
 
-def make_result(rel, st, sha, hits, max_matches):
+def make_result(rel, st, sha, hits, max_matches, gaps=None):
     counts = Counter(h[0] for h in hits)
     score = compute_score(hits)
     hits = sorted(hits, key=lambda h: (SEV_RANK[h[0]], h[1]))
@@ -980,6 +1024,8 @@ def make_result(rel, st, sha, hits, max_matches):
         "mode": "%04o" % stat.S_IMODE(st.st_mode), "sha256": sha or "",
         "score": score, "verdict": verdict_of(score),
         "counts": dict(counts), "hits": shown, "hidden": len(hits) - len(shown),
+        # engine gaps: internal bookkeeping (coverage counters), not a report field
+        "gaps": list(gaps or []),
     }
 
 
@@ -1056,7 +1102,15 @@ def scan_file(path):
         elif rel.startswith(CORE_PREFIXES) or ("/" not in rel and name.lower() != "configuration.php"):
             hits.append((O, 0, "file is not part of clean Joomla", rel, 10))
 
+    yara_gaps = []
+    for eng in get_engines(cfg):           # extra engines only: all built-in heuristics above stay as they are
+        e_hits, gap_reasons = eng.scan(ScanCtx(path=abspath, rel=rel, name=name, kind=kind,
+                                               raw=raw, size=st.st_size))
+        hits += e_hits
+        yara_gaps += gap_reasons
+
     enabled = cfg["enabled"] & {SEV_CRIT} if audit else cfg["enabled"]
+
     if kind in ("php", "htaccess"):
         hits += dupdir_hits(rel)
     if kind == "media":
@@ -1094,23 +1148,31 @@ def scan_file(path):
             hits += manifest_author_hits(rel, text, cfg["baseline_dirs"])
 
     hits = [h for h in hits if h[0] in enabled]
+    for reason in yara_gaps:               # an engine blind spot must never be silent (TZ v2 6.2):
+        hits.append((W, 0, "YARA rules did not fully scan this file: " + reason, "", 5))
     if not hits:
         return None, "scanned"
     if sha is None:
         sha = hashlib.sha256(raw).hexdigest()
-    return make_result(rel, st, sha, hits, mm), "scanned"
+    return make_result(rel, st, sha, hits, mm, gaps=yara_gaps), "scanned"
 
 
 def scan_batch(paths):
     if not CFG:     # a worker that never got its configuration must fail loudly, not report "error" for every file
         raise RuntimeError("scanner worker is not initialised (no configuration)")
     results, counters = [], Counter()
+    engines_on = bool(get_engines(CFG))   # coverage accounting for the extra engines (TZ v2 6.4)
     for p in paths:
         try:
             res, status = scan_file(p)
         except Exception:     # one bad file must not crash the whole scan
             res, status = None, "error"
         counters[status] += 1
+        if engines_on and status == "scanned":
+            if res is not None and res.get("gaps"):
+                counters["yara_gap"] += 1
+            else:
+                counters["yara_ok"] += 1
         if res:
             results.append(res)
     return results, dict(counters)
@@ -1665,6 +1727,16 @@ def build_parser():
     ap.add_argument("--strict", action="store_true",
                     help="exit code 3 when files could not be processed (the scan is incomplete) and nothing critical was found")
     ap.add_argument("--baseline-dir", help="folder with a CLEAN Joomla of the same version (where index.php lives)")
+    ap.add_argument("--yara-rules", help="a .yar file or a folder of .yar/.yara files run as an extra engine "
+                                         "(needs yara-python: requirements-optional.txt); broken rule files "
+                                         "are reported and skipped")
+    ap.add_argument("--no-yara", action="store_true", help="never run the YARA engine, even with --yara-rules")
+    ap.add_argument("--yara-cache", default="", help="folder for the compiled .yarac cache "
+                                                     "(default: scan-backdoors-yarac in the temp folder)")
+    ap.add_argument("--no-yara-cache", action="store_true", help="do not read or write the .yarac cache")
+    ap.add_argument("--yara-timeout", type=float, default=5.0,
+                    help="YARA time limit per file in seconds (5): a file that hits the limit is reported "
+                         "as a scan gap, never as clean")
     ap.add_argument("--workers", type=int, default=0, help="number of processes (0 = auto, 1 = no parallelism)")
     ap.add_argument("--no-progress", action="store_true", help="no progress indicator")
     ap.add_argument("--progress-lines", action="store_true",
@@ -1753,6 +1825,36 @@ def main(argv=None):
     skip_paths.add(os.path.abspath(__file__))     # the script itself contains all the signatures
 
     cms = detect_cms(start)
+
+    yara_spec = None
+    yara_eng = None
+    yara_files = []
+    if args.yara_rules and not args.no_yara:
+        if build_yara_engine is None:
+            print("YARA: this build has no engines/ package - the YARA engine is unavailable")
+            return 1
+        try:
+            yara_files = collect_rule_files(args.yara_rules)
+        except ValueError as e:
+            print("YARA:", e)
+            return 1
+        cache_dir = "" if args.no_yara_cache else (args.yara_cache or
+                        os.path.join(tempfile.gettempdir(), "scan-backdoors-yarac"))
+        yara_ext = {"cms": {"wp": "wordpress", "joomla": "joomla"}.get(cms, ""),
+                    "wp_root": cms == "wp", "joomla_root": cms == "joomla"}
+        yara_eng, yara_problems = build_yara_engine(
+            yara_files, cache_dir=cache_dir, base_externals=yara_ext, timeout=args.yara_timeout)
+        for msg in yara_problems:            # broken rules are visible before the scan even starts
+            print("YARA:", msg)
+        if yara_eng is None:
+            print("YARA: no rules are active - the scan runs with the built-in heuristics only")
+        else:
+            print("YARA: %d rule(s) from %d of %d file(s); per-file time limit %gs" %
+                  (yara_eng.rules_count, yara_eng.files_loaded, len(yara_files), args.yara_timeout))
+            yara_spec = {"sources": list(yara_files), "cache": cache_dir,
+                         "timeout": args.yara_timeout, "externals": dict(yara_ext)}
+            _YARA_ENGINES[yara_key(yara_spec)] = [yara_eng]   # the parent process reuses its own build
+
     cfg = {
         "start": start, "max_size": int(args.max_size * 1024 * 1024), "max_matches": args.max_matches,
         "since": since, "enabled": enabled, "wl_hashes": wl_hashes, "wl_paths": wl_paths,
@@ -1760,7 +1862,7 @@ def main(argv=None):
         "baseline_pkgs": set("/".join(r.split("/")[:4]) for r in (baseline or {}) if r.startswith("libraries/vendor/")), "posix": os.name != "nt",
         "exclude_ext": set(e.strip().lower() if e.strip().startswith(".") else "." + e.strip().lower()
                            for e in args.exclude_ext.split(",") if e.strip()),
-        "cms": cms, "audit_wl": args.audit_whitelisted,
+        "cms": cms, "audit_wl": args.audit_whitelisted, "yara": yara_spec,
     }
     excl_dirs = set(d.strip() for d in args.exclude_dir.split(",") if d.strip())
 
@@ -1869,6 +1971,13 @@ def main(argv=None):
             dup_counts[pre] += 1
     stats["Same-name nested folders"] = len(dup_counts)
 
+    yara_on = bool(args.yara_rules) and not args.no_yara
+    if yara_on:
+        stats["YARA: rule files"] = len(yara_files)
+        stats["YARA: rules loaded"] = yara_eng.rules_count if yara_eng is not None else 0
+        stats["YARA: files scanned"] = stats_c.get("yara_ok", 0)
+        stats["YARA: scan gaps (files not fully scanned)"] = stats_c.get("yara_gap", 0)
+
     print("\n" + "=" * 64)
     print("STATISTICS")
     print("  Files visited      : %d (scanned %d)" % (total, stats["Files scanned"]))
@@ -1887,6 +1996,13 @@ def main(argv=None):
     if stats["Whitelisted by path (content NOT scanned)"]:
         print("  Whitelisted by path: %d (content NOT scanned; --audit-whitelisted looks at them)"
               % stats["Whitelisted by path (content NOT scanned)"])
+    if yara_on:
+        print("  YARA               : %d rule(s) from %d file(s); files scanned %d, scan gaps %d" % (
+            stats["YARA: rules loaded"], stats["YARA: rule files"],
+            stats["YARA: files scanned"], stats["YARA: scan gaps (files not fully scanned)"]))
+        if stats["YARA: scan gaps (files not fully scanned)"]:
+            print("  WARNING            : YARA could not fully scan %d file(s) - see their [WARNING] hits"
+                  % stats["YARA: scan gaps (files not fully scanned)"])
     if stats["Read errors"]:
         print("  WARNING            : %d file(s) could not be processed - the scan is INCOMPLETE" % stats["Read errors"])
     print("=" * 64)

@@ -56,12 +56,13 @@ def tool_path(script):
     return os.path.join(SRC, script)
 
 
-def run(script, args, cwd=None, timeout=600):
+def run(script, args, cwd=None, timeout=600, env=None):
     """Run src/<script> with args -> CompletedProcess-like (returncode, out, err)."""
     proc = subprocess.Popen(
         [PYTHON, "-u", tool_path(script)] + [str(a) for a in args],
         cwd=cwd or SRC, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        universal_newlines=True, encoding="utf-8", errors="replace", env=ENV)
+        universal_newlines=True, encoding="utf-8", errors="replace",
+        env=dict(ENV, **(env or {})))
     try:
         out, err = proc.communicate(timeout=timeout) if timeout else proc.communicate()
     except Exception:

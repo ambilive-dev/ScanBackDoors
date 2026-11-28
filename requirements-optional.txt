@@ -1,0 +1,12 @@
+# Optional detection engines for ScanBackDoors.
+# The scanner itself needs NOTHING from this file: it is standard library only
+# (Python 3.6+). Install these only if you want the extra engines:
+#
+#   pip install -r requirements-optional.txt
+#
+# yara-python adds the YARA rules engine (--yara-rules). Without it the
+# scanner prints that the YARA engine is OFF and scans with the built-in
+# heuristics exactly as before.
+# TODO(verify): the minimum version that supports per-scan externals and the
+# include_callback reliably; developed and recorded against 4.5.4.
+yara-python>=4.1.0

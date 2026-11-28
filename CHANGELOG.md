@@ -5,6 +5,27 @@ version for all three components; it is written once in `src/version.py` and a
 release is a tag with that number.
 
 ## Unreleased
+- Scanner (TZ v2 Sprint 1): an optional YARA rules engine behind a new first-party
+  `engines/` package (`base_engine.py`: ScanCtx + BaseEngine returning
+  `(hits, gap_reasons)`; `yara_engine.py`: optional yara-python, imported lazily).
+  `--yara-rules FILE_OR_DIR` compiles rule files per file (a broken file is reported
+  and skipped, the rest keep working), refuses `include` directives, binds the
+  externals `file_name`/`extension`/`path`/`folder`/`file_size`/`cms`/`wp_root`/
+  `joomla_root`/`rule_language` per file at match time, and caches the compiled set
+  as a content-keyed `.yarac` (`--yara-cache`, `--no-yara-cache`). A rule hit is a
+  signature `YARA: <file>.<rule>`; meta `severity`/`score` map to severities and
+  weights, a rule without meta is never more than `[WARNING]`. A file that runs up
+  to `--yara-timeout` (yara-python returns incomplete matches silently) becomes a
+  visible scan gap: a `[WARNING]` hit plus `YARA: files scanned / scan gaps` in the
+  statistics - never a silent pass. `--no-yara` force-disables the engine; without
+  yara-python installed the scanner says so and behaves exactly as before (the
+  detection golden master is byte-identical with the engine off). New flags are
+  documented in README (EN/RU); `requirements-optional.txt` lists the optional
+  dependency. The GUI does not pass the new flags yet (settings schema unchanged).
+  Tests: `tests/test_yara_engine.py` (contract sync, wiring, isolation, externals,
+  cache self-heal, CLI degradation/end-to-end); `tests/test_compat.py` now holds
+  `engines/` to the same Python 3.6/stdlib-only floor and allows only lazy imports
+  of third-party modules.
 - Tests/tools (TZ v2 Sprint 0, no behavior change): a characterization golden master
   (`tests/test_golden_scan.py` + `tests/golden/planted_scan.json`, re-recorded by
   `tools/record_golden.py`) pins the current detection result of the planted fixture
