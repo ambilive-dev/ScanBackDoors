@@ -96,12 +96,36 @@ The page remembers the last state (log, results) while the server runs, so you c
 
 ### First run in the GUI
 
-1. **Settings** tab: choose the *Site folder* (optionally a *Clean Joomla* folder, a *Whitelist* and the report paths). **Browse…** opens a file chooser that lists the folders of the machine where the server runs.
-2. **Run and results** tab: press *Start scan*. The progress bar and the log show the scan, the table lists the findings.
-3. Select rows (click, Ctrl/Shift+click, Ctrl+A) and use *Show file*, *Quarantine*, *Delete from disk* (or the Delete key), or the right-click menu (copy path, copy SHA-256, add to whitelist). *Mass cleanup* handles the known malware families across the whole site: it first shows a plan and asks for confirmation.
-4. Open the reports (CSV/XLSX/JSON) with the buttons above the table, or download them through the links next to them.
+1. **Settings** tab: choose the *Site folder* (optionally a *Clean Joomla* folder, a *Whitelist* and the report paths). No clean copy of the same version at hand? The *Fetch baseline* button next to the *Clean Joomla (optional)* field detects the site's Joomla version from its own files, asks you to confirm (`Download the clean Joomla x.y.z baseline?`), downloads the official Full_Package from the `joomla/joomla-cms` GitHub releases over HTTPS with progress in the Log tab, and fills the field in automatically. This is the only part of the app that reaches the internet, and only after that confirmation. The tab is a centered two-column grid of four cards — *1. Scan scope & targets* (paths), *2. Heuristic scoring & flags* (thresholds, exclusions, flags), *3. Mass cleanup* (mode, family, core-file restore) and *4. AI review (local model)* (endpoint, model, flags) — with a *Go to run →* button in the header. **Browse…** opens a file chooser that lists the folders of the machine where the server runs.
+2. **Run and results** tab: press *Start scan*. Before the scan starts the GUI checks that the loaded *Clean Joomla* folder matches the site's detected Joomla version; on a mismatch (or when no baseline is set) it offers to fetch the matching baseline first - the scan then resumes automatically when the download finishes - or to scan without originals with your consent (core files are then judged by heuristics only, and the Log says so). The footer shows what the site runs: the detected Joomla version plus third-party engines that publish their version (VirtueMart and similar extensions whose originals are freely downloadable). The Details/Log panel has a third tab, **Engines**, listing every detected engine with its version and an original-loaded mark for the Joomla core (✓ loaded, ✗ the Clean Joomla folder holds another version, or not downloaded, with the folder path) and a *Fetch baseline* shortcut. A baseline downloaded through the GUI makes the next scan faster: the scanner reuses the sha256 manifest `joomla_baseline.py` wrote at download time instead of re-hashing the baseline tree. The tab is built around the results table in a self-contained, dark-first theme (light mode available; both persisted per browser, `prefers-color-scheme` honoured, no external fonts or CDNs): a slim top bar with the embedded logo, the icon-bearing Settings / Run and results tabs, a connection badge, a round dark/light sun/moon pill and the *Quit server* button; below it a run row (Start/Stop, progress bar, status line with files done, elapsed, estimated remaining time and the file currently processed, *AI review* with a threats/errors counter next to it, a *Remove false positives* button, *Candidates* with a count of the signature groups it offers and a *Reports* menu); a two-row toolbar — live level chips (All / High / Medium / Low with colored per-level counts, computed by the backend from the query + AI-filtered base), a search box (press `/`), an AI verdict filter and a Reset button on the first row, the actions row (Show file / Quarantine / Delete from disk / Mass cleanup / Select all, each with a line icon) on the second; and, in its own scroll region with a sticky table header, a table that is almost the whole tab. On wide screens (at least 1100 px) the table takes two thirds of the tab and the Details/Log panel sits in the right column (one third, resizable by dragging the gutter) instead of underneath the table; the fold button is hidden there, because the panel no longer collapses vertically. On narrower screens the layout is the classic stacked one: table on top, panel below it. Click a column header to sort (Score sorts descending by default).
+3. Select rows (click, Ctrl/Shift+click, Ctrl+A, or the leading checkboxes — the header checkbox selects or clears all visible rows) and the Details/Log panel — below the table on narrow screens, in the right column on wide screens — shows the selected finding: the full file path with a Copy button, the SHA-256 digest and the signature rule as cards, an AI heuristic verdict box with the badge and the comment, and the source snippet in a scrollable panel (the AI column in the table itself is colored text — ⚠ threat / ✓ false positive — and the verdict box is tinted to match; the level column uses solid rose/amber/slate badges). Switch between the **Details** and **Log** tabs; drag the gutter to resize the panel, double-click the gutter or the fold button to collapse it. Use *Show file*, *Quarantine*, *Delete from disk* (or the Delete key) or the right-click menu (copy path, copy SHA-256, add to whitelist). *Mass cleanup* handles the known malware families across the whole site: it first shows a plan and asks for confirmation. The level chips and the search/AI filters combine — the chip counts stay live and reflect the current query and AI filter.
+4. Open the reports (CSV/XLSX/JSON) with the *Reports* menu (*Open reports folder* for the folder, then *Open CSV/XLSX/JSON* to open a report, or the *Download CSV/XLSX/JSON* anchors to save one through the browser).
 
 Settings are saved automatically in `~/.scan_backdoors_gui.json` (the same file the older desktop version used). The command-line options are described below.
+
+
+### AI review (local model)
+
+After a scan, the **Run and results** tab offers two optional actions:
+
+* **🤖 AI review** — sends each suspicious file (one request per unique path, the highest-priority finding of each) to a local AI endpoint you choose, and stores a verdict per file. If rows are selected in the table, the review covers exactly the files behind the selection — all of them, without the 100-file cap; with no selection it covers the whole report, capped at the 100 most critical files. Only *localhost* endpoints are allowed (`127.0.0.1`, `localhost`, `[::1]`), the endpoint is validated before any request is sent, and the request carries the evidence — the finding's metadata, snippets and a bounded context — never the whole file. The verdict lands in the CSV report in the columns **AI Verdict** / **AI Comment** (the scanner's own `Verdict` column is never overwritten), and in the table as an AI badge. The table filter **AI** offers: all rows, malicious only (`real_threat`), clean only (`false_positive`), not reviewed yet (no verdict) and hide false positives (everything except `false_positive`).
+* **🧪 Candidates for the signature library** — composes, from the real-threat verdicts, the grouped signatures with their evidence (files, lines, snippets, AI comments) as candidates for the scanner's signature library. The candidates are presented as evidence and labels, *not* as fabricated regexes — review them and add the confirmed ones by hand; the scanner is never modified automatically.
+
+Right after the review finishes, the GUI asks two more questions (neither is applied without confirmation):
+
+* **Remove false positives from the threat list?** — if the review marked files as `false_positive`, the GUI asks whether to remove them from the threat list. The rows are hidden from the table and kept in the CSV report, marked `AI Handled=false_positive`. They are never deleted, and the whitelist is never touched — a later scan still lists the rows; only this AI-review-era list changes.
+* **Add AI-prepared signatures to the library?** — if the review found real threats, the AI is asked, per real-threat file, to prepare one scanner signature (the same bounded-evidence discipline as the review). The proposals are shown, and only on your confirmation are they written to the user signature library (`%USERPROFILE%\.scan_backdoors_user_signatures.json`, a separate JSON file). The scanner reads that library on the next scan via `--user-signatures` (the GUI passes the flag automatically when the file exists and is not empty). Nothing is written otherwise.
+
+The run row keeps the AI cluster alive afterwards: once a review has produced verdicts, a counter appears right of the AI review button (`🤖 threats: N · ⚠ errors: M` — the number of real threats and the number of errored files; both numbers are shown even when one is 0), the **Candidates (K)** button shows how many signature groups the review offers (the real-threat files grouped by signature), and a separate **Remove false positives (M)** button is available at any time — not only right after the review — with the same persistence as the post-review flow: the rows stay in the CSV report, marked `AI Handled=false_positive`, and are only hidden from the table. While a job runs or when the AI is disabled, the counter is hidden and the buttons are greyed out.
+
+The settings live on the Settings tab (section *AI review (local model)*):
+
+| Setting | Meaning |
+|---|---|
+| Enable AI review | Turn the feature on/off. When disabled, the AI buttons are greyed out. |
+| Endpoint | The local OpenAI-compatible base URL (e.g. `http://127.0.0.1:8080/v1`). Only `http`/`https` URLs on localhost are accepted, without credentials, query string or fragment. |
+| Model | The model to request (optional). When empty, the model the gateway has loaded (queried from its `/v1/models` endpoint) is used. |
+
 
 ## Command line
 
@@ -218,6 +242,32 @@ A mask never spans folders: `components/com_k2/*.php` matches `components/com_k2
 
 A line that is neither a 64-hex hash nor a path (a hex string of another length, binary garbage) is reported by line number and skipped; the scan goes on. A whitelist file that cannot be read at all still stops the run.
 
+### User signatures (AI-prepared or hand-written)
+
+The scanner can load extra signatures from a JSON library. The GUI's signature flow writes this file automatically (confirmed by you); you can also create it by hand.
+
+| Option | Description |
+|---|---|
+| `--user-signatures FILE` | Extra signatures to load (one JSON array, or an object with a `signatures` array). Entries are validated: a malformed entry is reported and skipped, never silently swallowed. A missing file stops the run. |
+
+```bash
+python3 scan_backdoors.py /home/user/site --user-signatures my-signatures.json
+```
+
+**Library format** (one entry per signature):
+
+```json
+[
+  {"label": "my-webshell", "pattern": "some_literal_or_regex",
+   "severity": "critical", "kinds": "php", "weight": 25,
+   "flags": "i", "reason": "why this signature matches"}
+]
+```
+
+* `label` (2-200 chars; the GUI writes 2-120), `pattern` (valid regex, 2-400 chars, must not match `""` or `" "`), `severity` (`critical`, `obfuscated` or `warning`), `kinds` (at least one of: `php`, `js`, `html`, `htaccess`, `ini`, `text`, space-separated), `weight` (optional, integer 1-30), `flags` (`i` for case-insensitive, the default when omitted; `none` for case-sensitive), `reason` (optional, up to 400 chars), `created` (ISO date, set by the GUI).
+* Entries are validated on load; the scanner never crashes on a broken pattern.
+* The GUI writes its confirmed proposals to `%USERPROFILE%\.scan_backdoors_user_signatures.json` (you can inspect the file; entries with the same label and pattern are replaced, not duplicated) and passes `--user-signatures` on the next scan when the file exists and is not empty.
+
 ### Performance and output
 
 | Option | Default | Description |
@@ -252,6 +302,9 @@ python3 scan_backdoors.py . --workers 4 --no-progress
 | Modified | File modification date. |
 | Delete | Your own mark. `No` everywhere by default, change it to `Yes` after review. |
 | SHA-256 | File hash (for the whitelist and for lookups in online databases). |
+| AI Verdict | The AI's verdict for the file: `real_threat`, `false_positive`, `uncertain` or `error`. Empty when the file was not reviewed - the scanner's own `Verdict` column is untouched and never overwritten. |
+| AI Comment | The AI's short evidence for the verdict (truncated to 1200 characters). |
+| AI Handled | The GUI's mark: alse_positive means the rows are hidden from the table (they stay in the CSV; never delete them by hand). |
 
 ---
 
@@ -372,7 +425,7 @@ joomla-baselines/Joomla_3.9.27.baseline.json   <- manifest: every file and its s
 | `--force` | re-download even when the cached baseline is valid |
 | `--keep-archive` | keep the downloaded zip |
 
-A re-run verifies the cached baseline offline (no network) and re-downloads only if a file changed. The resulting folder is accepted by both `scan_backdoors.py --baseline-dir` and `clean_malware.py --replace-core --baseline-dir`. The tool talks to `api.github.com` and GitHub's download CDN over HTTPS only: a download URL taken from the release API must point at those hosts, a truncated download (fewer bytes than `Content-Length`) and a corrupted archive are reported as a clear error, never left behind as a partial baseline.
+The scanner uses the manifest directly: with `--baseline-dir` pointing at a downloaded folder it reuses the recorded hashes instead of re-hashing thousands of files (files missing from the manifest are hashed on the spot, so a hand-edited baseline can never make a modified core file look clean). A re-run verifies the cached baseline offline (no network) and re-downloads only if a file changed. The resulting folder is accepted by both `scan_backdoors.py --baseline-dir` and `clean_malware.py --replace-core --baseline-dir`. The tool talks to `api.github.com` and GitHub's download CDN over HTTPS only: a download URL taken from the release API must point at those hosts, a truncated download (fewer bytes than `Content-Length`) and a corrupted archive are reported as a clear error, never left behind as a partial baseline.
 
 ---
 
